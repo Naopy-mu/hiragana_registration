@@ -1,0 +1,29 @@
+{
+  "profile": "test",
+  "version": "test-2026-11-10",
+  "title": "筆跡収集・動作確認用",
+  "consent_version": "2026-11-10-v1",
+  "consent_text": "電気通信大学「情報工学工房A」の活動として、ひらがなの手書き文字を集めています。集めたデータは、文字の形や書き方の特徴を学習し、その特徴を反映した文字画像を生成するモデルの開発と評価に使います。\n\nお願いすること\n指定の用紙にひらがなを書き、記入した用紙をスマートフォンで撮影して、このサイトから提出してください。用紙には氏名などの個人情報を書かないでください。提出データは、登録時に自動発行される参加者IDで管理します。\n\nデータの取り扱い\n提出された元の写真、補正した画像、提出内容をまとめたPDFは、アクセスを制限した保存先で管理します。閲覧・利用できるのは、この研究の研究者のみです。授業内で成果を報告するときにデータを一部使用する可能性があります。",
+  "description": "開発専用。HIRA1-01のみ添付写真で確認済み。TEST-02/03は架空のテストコード。総ページ数は本番情報ではありません。",
+  "worksheet": {
+    "path": "resources/worksheets/test-worksheet.pdf",
+    "title": "記入用紙（動作確認用）",
+    "filename": "test-worksheet.pdf",
+    "test_only": true
+  },
+  "geometry": {
+    "paper_mm": [210, 297],
+    "marker_centers_mm": [[20, 20], [190, 20], [190, 277], [20, 277]],
+    "output_width": 1654,
+    "qr_center_region": [0.36, 0.83, 0.64, 0.985],
+    "qr_size_mm": [2, 25],
+    "calibrated": false,
+    "calibration_note": "添付写真からの概算。配布原本で実測して本番設定を作成してください。",
+    "min_focus": 80
+  },
+  "pages": [
+    {"qr_code": "HIRA1-01", "page_number": 1, "label": "テスト1（確認済みQR）", "required": true},
+    {"qr_code": "TEST-02", "page_number": 2, "label": "テスト2（架空）", "required": true},
+    {"qr_code": "TEST-03", "page_number": 3, "label": "テスト3（架空）", "required": true}
+  ]
+}

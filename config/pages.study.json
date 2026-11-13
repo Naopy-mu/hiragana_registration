@@ -1,0 +1,104 @@
+{
+  "consent_text": "電気通信大学「情報工学工房A」の活動として、ひらがなの手書き文字を集めています。集めたデータは、文字の形や書き方の特徴を学習し、その特徴を反映した文字画像を生成するモデルの開発と評価に使います。\n\nお願いすること\n指定の用紙にひらがなを書き、記入した用紙をスマートフォンで撮影して、このサイトから提出してください。用紙には氏名などの個人情報を書かないでください。提出データは、登録時に自動発行される参加者IDで管理します。\n\nデータの取り扱い\n提出された元の写真、補正した画像、提出内容をまとめたPDFは、アクセスを制限した保存先で管理します。閲覧・利用できるのは、この研究の研究者のみです。授業内で成果を報告するときにデータを一部使用する可能性があります。",
+  "consent_version": "2026-11-10-v1",
+  "profile": "production",
+  "version": "pdf-5455aced0645",
+  "page_count": 8,
+  "sha256": "5455aced06454ac6302b8056bfb9ef10dce11793d24809485101e527bc93f417",
+  "pages": [
+    {
+      "qr_code": "HIRA1-01",
+      "page_number": 1,
+      "label": "1ページ",
+      "required": true
+    },
+    {
+      "qr_code": "HIRA1-02",
+      "page_number": 2,
+      "label": "2ページ",
+      "required": true
+    },
+    {
+      "qr_code": "HIRA1-03",
+      "page_number": 3,
+      "label": "3ページ",
+      "required": true
+    },
+    {
+      "qr_code": "HIRA1-04",
+      "page_number": 4,
+      "label": "4ページ",
+      "required": true
+    },
+    {
+      "qr_code": "HIRA1-05",
+      "page_number": 5,
+      "label": "5ページ",
+      "required": true
+    },
+    {
+      "qr_code": "HIRA1-06",
+      "page_number": 6,
+      "label": "6ページ",
+      "required": true
+    },
+    {
+      "qr_code": "HIRA1-07",
+      "page_number": 7,
+      "label": "7ページ",
+      "required": true
+    },
+    {
+      "qr_code": "HIRA1-08",
+      "page_number": 8,
+      "label": "8ページ",
+      "required": true
+    }
+  ],
+  "geometry": {
+    "paper_mm": [
+      210,
+      297
+    ],
+    "marker_centers_mm": [
+      [
+        10.0,
+        10.0
+      ],
+      [
+        200.0,
+        10.0
+      ],
+      [
+        200.0,
+        287.0
+      ],
+      [
+        10.0,
+        287.0
+      ]
+    ],
+    "output_width": 1654,
+    "calibrated": true,
+    "calibration_note": "配布原本PDFのA4座標から取得。黒丸は200dpi画像で確認し、ベクター円がある場合は描画座標とも照合。",
+    "min_focus": 80,
+    "qr_center_region": [
+      0.4497,
+      0.93417,
+      0.5497,
+      0.98428
+    ],
+    "qr_size_mm": [
+      3.98,
+      11.58
+    ]
+  },
+  "title": "筆跡収集",
+  "description": "提供された配布原本PDFの全ページからQR・順序・黒丸座標を確認済み。",
+  "worksheet": {
+    "path": "resources/worksheets/hiragana_collection_a4.pdf",
+    "title": "ひらがな筆跡収集用紙",
+    "filename": "hiragana_collection_a4.pdf",
+    "test_only": false
+  }
+}

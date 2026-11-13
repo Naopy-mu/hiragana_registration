@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#123d45">
+  <meta name="referrer" content="no-referrer">
+  <title>筆跡収集 | 研究参加ポータル</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">本文へ移動</a>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="筆跡収集 ホーム"><span class="brand-symbol" aria-hidden="true">筆</span><span>筆跡収集<span class="brand-sub">RESEARCH COLLECTION</span></span></a>
+    <a id="mode-link" class="mode-link" href="/researcher">研究者の方へ <span aria-hidden="true">↗</span></a>
+  </header>
+  <main id="main" class="shell">
+    <div id="profile-banner" class="test-banner" hidden><span class="test-label">TEST MODE</span><span>動作確認用の用紙設定です。本番の必要ページ・位置設定を確定してから研究に使用してください。</span></div>
+    <div id="app-error" class="notice error" role="alert" hidden></div>
+    <div id="app-status" class="sr-only" role="status" aria-live="polite"></div>
+    <div id="boot" class="boot card"><span class="spinner" aria-hidden="true"></span>画面を準備しています…</div>
+
+    <section id="registration-view" hidden>
+      <div class="intro"><p class="eyebrow">HANDWRITING RESEARCH</p><h1 id="study-title">あなたの手書きを、<br>研究につなぐ。</h1><p class="lead">同意後に用紙をダウンロードし、印刷・記入して撮影します。<br class="desktop-break">アカウントの作成は必要ありません。</p></div>
+      <ol class="journey" aria-label="参加の流れ"><li class="active"><span>01</span>説明・同意</li><li><span>02</span>印刷・記入・撮影</li><li><span>03</span>確認・提出</li></ol>
+      <div class="registration-layout">
+        <section class="card consent-card" aria-labelledby="consent-title"><div class="section-top"><span class="section-kicker">STEP 01</span><span class="small muted" id="consent-version"></span></div><h2 id="consent-title">筆跡データの提供に関する説明と同意</h2><p class="muted small">内容を確認し、同意のうえ参加を開始してください。</p><div id="consent-text" class="consent-text"></div><p class="small">同意チェック欄</p><label class="check-row consent-check"><input id="consent-checkbox" type="checkbox"><span>上記の説明を読み、筆跡データをこの活動のために提供し、モデルの開発・評価に利用することに同意します。</span></label><button id="register-button" class="button primary full" type="button" disabled>同意して参加する <span aria-hidden="true">→</span></button><p class="small muted register-note">参加者IDが自動で発行されます。氏名・メールアドレスの入力はありません。</p></section>
+        <aside class="preparation"><span class="large-icon" aria-hidden="true">▤</span><h2>お手元にご用意ください</h2><ul class="simple-list"><li>A4用紙を印刷できる環境と筆記用具</li><li>カメラ付きのスマートフォン</li><li>明るく、平らな撮影場所</li></ul><div class="aside-rule"></div><h3>途中で閉じても大丈夫</h3><p>参加を始めると、用紙PDFと専用の再開リンクが表示されます。リンクを保存しておけば、同じ参加者IDで続きを送信できます。</p></aside>
+      </div>
+    </section>
+
+    <section id="participant-view" hidden>
+      <div class="participant-heading"><div><p class="eyebrow">YOUR COLLECTION</p><h1 id="participant-heading-title">用紙を撮影して登録</h1><p class="lead" id="participant-lead">用紙はどの順番からでも登録できます。</p></div><div class="id-badge"><span>あなたの参加者ID</span><strong id="participant-id"></strong></div></div>
+      <section class="resume-card" aria-label="再開リンク"><div><strong>このページの再開リンクを保存</strong><p>このリンクを知っている人は、あなたの登録内容を開けます。他の人に共有しないでください。</p></div><button id="copy-link" class="button secondary compact" type="button">リンクをコピー</button><input id="resume-link" class="link-field" readonly aria-label="専用再開リンク"></section>
+      <section id="worksheet-section" class="card worksheet-card" aria-labelledby="worksheet-title">
+        <div class="worksheet-information"><span class="section-kicker">PRINT &amp; WRITE</span><h2 id="worksheet-title">1. 用紙をダウンロード</h2><p id="worksheet-file-title" class="small muted"></p><p id="worksheet-test-note" class="worksheet-test-note" hidden>動作確認用の用紙です。本番用紙ではありません。</p><p class="small worksheet-print-guide">A4・片面・「実際のサイズ（100%）」で印刷し、記入してください。氏名などの個人情報は書かないでください。</p></div>
+        <div class="worksheet-actions"><button id="download-worksheet" class="button primary" type="button" hidden>記入用紙をダウンロード（PDF）</button><p id="worksheet-unavailable" class="small muted" hidden>配布用紙は準備中です。</p><div id="worksheet-message" class="notice error" role="alert" hidden></div></div>
+      </section>
+      <div class="collection-layout">
+        <div class="collection-main">
+          <section id="upload-section" class="card" aria-labelledby="upload-title"><div class="section-top"><span class="section-kicker">CAPTURE</span><span class="small muted">1枚ずつ登録</span></div><h2 id="upload-title">2. 記入した用紙を撮影</h2><p class="muted">四隅の黒丸と用紙の端、下部のQRコードがすべて入るように撮影します。</p><div class="capture-guide" aria-hidden="true"><div class="paper-illustration"><i></i><i></i><i></i><i></i><span class="paper-lines"></span><span class="paper-qr">▦</span></div><div><strong>四隅まで、くっきりと。</strong><p>用紙を1枚ずつ置き、真上から撮影。<br>手やスマホの影を避けてください。</p></div></div><div class="capture-actions"><button id="camera-button" class="button primary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5 6.5 8H4a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-2.5L16 5z"/><circle cx="12" cy="13" r="4"/></svg>カメラで撮影</button><button id="gallery-button" class="button secondary" type="button">撮影済み画像を選ぶ</button></div><input id="camera-input" type="file" accept="image/*" capture="environment" hidden><input id="gallery-input" type="file" accept="image/*" hidden><div id="upload-progress" class="upload-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span>QR・四隅・画質を確認し、補正しています…</div><div id="upload-error" class="notice error" role="alert" hidden></div><p class="small muted" id="upload-format-note">JPEG・PNGなどの画像を選択できます。HEICの場合はJPEGに変換してください。</p></section>
+          <section id="latest-preview" class="card preview-card" hidden><div class="section-top"><span class="section-kicker">CHECKED</span><span class="success-chip">登録できました</span></div><h2 id="latest-title">補正後のプレビュー</h2><p class="small muted">傾きと明るさを補正した画像です。文字の欠けや読みにくさがあれば、同じ用紙を撮り直して差し替えられます。</p><button id="preview-open" class="preview-open" type="button" aria-label="補正画像を拡大"><img id="latest-image" alt="直近に登録した用紙の補正画像"><span>タップして拡大 ↗</span></button></section>
+          <section id="submitted-panel" class="card submitted-card" hidden><span class="submitted-icon" aria-hidden="true">✓</span><p class="eyebrow">SUBMITTED</p><h2>提出が完了しました</h2><p>ご協力ありがとうございます。<br>画像とPDFは研究者が回収できる状態で保存されました。</p><button id="download-pdf" class="button secondary" type="button">自分のPDFを確認する</button></section>
+        </div>
+        <aside class="card progress-card" aria-labelledby="pages-title"><div class="section-top"><span class="section-kicker">YOUR PAGES</span><span id="page-count" class="count-pill">0 / 0</span></div><h2 id="pages-title">登録状況</h2><div class="progress-track" role="progressbar" aria-label="必須ページ登録状況" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progress-fill"></span></div><p id="progress-description" class="small muted"></p><ul id="page-list" class="page-list"></ul><div class="submit-area"><p id="submit-hint" class="small muted"></p><button id="submit-button" class="button primary full" type="button" disabled>提出する <span aria-hidden="true">→</span></button><p class="small muted">提出後は画像を変更できません。すべてのページをご確認ください。</p></div></aside>
+      </div>
+    </section>
+
+    <section id="researcher-view" hidden>
+      <div class="researcher-heading"><div><p class="eyebrow">RESEARCHER WORKSPACE</p><h1>研究者モード</h1><p class="lead">参加状況の確認と、研究データの回収。</p></div><button id="logout-button" class="button secondary compact" type="button" hidden>ログアウト</button></div>
+      <section id="login-panel" class="card login-card"><span class="section-kicker">RESTRICTED ACCESS</span><h2>研究者としてログイン</h2><p class="muted">研究者用パスワードを入力してください。</p><form id="login-form"><label class="field-label" for="password-input">パスワード</label><input id="password-input" class="text-input" type="password" autocomplete="current-password" required><button id="login-button" class="button primary full" type="submit">ログイン <span aria-hidden="true">→</span></button></form><div id="login-error" class="notice error" role="alert" hidden></div></section>
+      <div id="researcher-content" hidden><div id="research-stats" class="research-stats"></div>
+        <section id="worksheet-management" class="card worksheet-management" aria-labelledby="worksheet-management-title">
+          <div class="section-top"><span class="section-kicker">STUDY WORKSHEET</span><span class="small muted">新しく参加する方への配布用紙</span></div>
+          <h2 id="worksheet-management-title">配布用紙の管理</h2>
+          <div class="worksheet-management-grid">
+            <div class="current-worksheet"><span class="small muted">現在の配布用紙</span><h3 id="current-worksheet-name">読み込み中…</h3><p id="current-worksheet-count" class="small"></p><p id="current-worksheet-date" class="small muted"></p><button id="download-current-worksheet" class="button secondary compact" type="button" disabled>現在のPDFをダウンロード</button><details id="current-worksheet-pages-details" class="worksheet-page-details" hidden><summary>ページ順とQRを確認</summary><ol id="current-worksheet-pages" class="worksheet-qr-list"></ol></details></div>
+            <div class="replace-worksheet"><label class="field-label" for="revision-file">差し替えるPDF</label><p class="small muted">A4の原本PDFを選択してください。全ページのQRと四隅の黒丸を確認してから、配布する用紙を変更します。</p><input id="revision-file" class="revision-file" type="file" accept="application/pdf,.pdf"><button id="inspect-worksheet" class="button secondary" type="button" disabled>PDFを確認</button><div id="worksheet-draft" class="worksheet-draft" hidden><h3 id="draft-worksheet-name"></h3><p id="draft-worksheet-count" class="small"></p><details class="worksheet-page-details" open><summary>新しい用紙のページ順とQR</summary><ol id="draft-worksheet-pages" class="worksheet-qr-list"></ol></details><div class="revision-draft-actions"><button id="preview-draft-worksheet" class="button secondary compact" type="button" disabled>確認したPDFをダウンロード</button><button id="activate-worksheet" class="button primary" type="button" disabled>この用紙に差し替える</button></div></div><p class="small muted revision-participant-note">変更は新しく参加する方から適用します。登録済みの参加者は、登録時の用紙で続けられます。</p></div>
+          </div><div id="revision-message" class="notice" role="status" hidden></div>
+        </section><div class="research-layout"><section class="card roster-card"><div class="section-top"><span class="section-kicker">PARTICIPANTS</span><button id="refresh-participants" class="text-button" type="button">一覧を更新 ↻</button></div><h2>参加者一覧</h2><p class="small muted">個別回収する場合は、対象の参加者を選択してください。</p><div class="table-scroll"><table><thead><tr><th><input id="select-all" type="checkbox" aria-label="一覧の参加者を全選択"></th><th>参加者ID</th><th>登録日時</th><th>状況</th><th>ページ</th></tr></thead><tbody id="participant-rows"></tbody></table></div><p id="empty-roster" class="empty-state" hidden>まだ参加者は登録されていません。</p></section><aside class="card export-card"><span class="section-kicker">DOWNLOAD</span><h2>データをまとめて回収</h2><fieldset><legend>1. 対象者</legend><label class="check-row"><input type="radio" name="export-scope" value="submitted" checked><span>提出済みの全員</span></label><label class="check-row"><input type="radio" name="export-scope" value="selected"><span>一覧で選択した参加者 <span id="selected-count" class="small muted">（0人）</span></span></label></fieldset><fieldset><legend>2. ファイルの種類</legend><label class="check-row"><input type="checkbox" name="export-type" value="pdf" checked><span>PDF <small>ページ順に結合済み</small></span></label><label class="check-row"><input type="checkbox" name="export-type" value="original"><span>元写真 <small>アップロード時の画像</small></span></label><label class="check-row"><input type="checkbox" name="export-type" value="corrected"><span>補正済みPNG <small>用紙ごとの補正画像</small></span></label><label class="check-row"><input type="checkbox" name="export-type" value="csv" checked><span>対応表CSV <small>ID・QR・ページ・ファイル名</small></span></label></fieldset><p class="small muted">選択した種類だけを、参加者ID別のフォルダにまとめます。</p><button id="export-button" class="button primary full" type="button">ZIPをダウンロード ↓</button><div id="export-message" class="notice" role="status" hidden></div></aside></div></div>
+    </section>
+  </main>
+  <footer class="site-footer"><span>筆跡収集 · 研究参加ポータル</span><span>専用リンクとデータは大切に保管してください。</span></footer>
+  <dialog id="preview-dialog" class="image-dialog"><div class="dialog-heading"><strong id="dialog-image-title">補正画像</strong><button id="close-preview" class="button secondary compact" type="button">閉じる ×</button></div><img id="dialog-image" alt="拡大した補正画像"></dialog>
+  <dialog id="confirm-dialog" class="confirm-dialog"><h2 id="confirm-title">画像を差し替えますか？</h2><p id="confirm-description"></p><div class="dialog-actions"><button id="confirm-cancel" class="button secondary" type="button">キャンセル</button><button id="confirm-accept" class="button primary" type="button">差し替える</button></div></dialog>
+</body>
+</html>
