@@ -11,6 +11,9 @@ import numpy as np
 from app.imaging import ImageValidationError, _decode_qr, _marker_candidates
 
 
+MAX_PDF_PAGES = 500
+
+
 class PdfFormError(ValueError):
     def __init__(self, code: str, message: str):
         self.code, self.message = code, message
@@ -83,8 +86,8 @@ def analyze_pdf(data: bytes) -> dict:
     try:
         if document.needs_pass or document.is_encrypted:
             raise PdfFormError('encrypted_pdf', 'パスワードで保護されていないPDFを選んでください。')
-        if not 1 <= document.page_count <= 64:
-            raise PdfFormError('invalid_page_count', '用紙PDFは1〜64ページにしてください。')
+        if not 1 <= document.page_count <= MAX_PDF_PAGES:
+            raise PdfFormError('invalid_page_count', f'用紙PDFは1〜{MAX_PDF_PAGES}ページにしてください。')
         pages, geometries, qr_centers, qr_sizes = [], [], [], []
         seen = set()
         for index, page in enumerate(document, 1):

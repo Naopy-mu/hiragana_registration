@@ -66,14 +66,26 @@ def test_encrypted_pdf_rejected_before_rendering():
     assert error.value.code == 'encrypted_pdf'
 
 
-def test_overlarge_page_count_rejected_before_rendering():
+@pytest.mark.parametrize('page_count,expected', [(500, 'pdf_qr_unreadable'), (501, 'invalid_page_count')])
+def test_page_limit_boundary_and_qr_validation(page_count, expected):
     with fitz.open() as document:
-        for _ in range(65):
+        for _ in range(page_count):
             document.new_page(width=A4[0], height=A4[1])
         data = document.tobytes()
     with pytest.raises(PdfFormError) as error:
         analyze_pdf(data)
-    assert error.value.code == 'invalid_page_count'
+    assert error.value.code == expected
+    if expected == 'invalid_page_count':
+        assert '500' in error.value.message
+
+
+def test_valid_pdf_above_previous_64_page_limit():
+    codes = [f'LARGE-{number:03d}' for number in range(1, 66)]
+    result = analyze_pdf(pdf_bytes(codes))
+    assert result['page_count'] == 65
+    assert [page['qr_code'] for page in result['pages']] == codes
+    assert result['pages'][-1]['page_number'] == 65
+    assert result['geometry']['calibrated'] is True
 
 
 def test_rotated_print_original_rejected_with_actionable_reason():
