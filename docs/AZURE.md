@@ -5,7 +5,7 @@
 ## 1. 公開前にローカルでそろえる
 
 1. 提供原本`resources/worksheets/hiragana_collection_a4.pdf`と、全8ページのQR・順序・黒丸位置を記録した`config/pages.study.json`を初期設定として使用します。同意文は提供済みの版`2026-11-10-v1`です。`pages.test.json`と3ページのテスト用紙は公開用ではありません。以降の配布PDF変更は研究者画面の「配布用紙」から、新PDFを選択→確認→差し替え確定の順で行います。
-2. READMEのSupabase手順に従い、SQL Editorで`migrations/001_initial.sql`、次に`migrations/002_worksheet_revisions.sql`を実行し、非公開の`handwriting-private`バケットを確認します。既存環境には未適用の002を追加実行します。
+2. READMEのSupabase手順に従い、SQL Editorで`migrations/001_initial.sql`、`migrations/002_worksheet_revisions.sql`、`migrations/003_expire_empty_participants.sql`を順に実行し、非公開の`handwriting-private`バケットを確認します。既存環境には未適用のSQLだけを追加実行します。004は写真0枚のIDの自動削除を有効にするSQLです（下記参照）。
 3. `scripts/set_password.py`で本番の研究者パスワードハッシュを生成します。開発用パスワードをそのまま流用しないでください。
 4. 次の鍵生成コマンドを2回実行し、研究者セッション用の`SESSION_SECRET`と、参加者リンク用の`PARTICIPANT_TOKEN_SECRET`へ別々の値を設定します。パスワード管理ツールなどで保管し、参加者用の鍵は収集期間中に変更しません。
 
@@ -137,6 +137,33 @@ az webapp log tail --name $researchApp --resource-group $researchGroup
 | Storageで失敗 | バケット名、Private設定、サーバーSecret key、ファイルサイズ制限。Publishable keyに差し替えない |
 | ログイン後すぐ未認証 | HTTPSで開いているか、`COOKIE_SECURE=true`、正しいホスト名、各workerが同じセッション鍵を使っているか |
 | 写真処理に時間がかかる／worker終了 | ログストリームのメモリ・タイムアウトを確認し、App Serviceの性能を上げる。原本座標を変更して回避しない |
+
+## 写真0枚のIDの自動削除
+
+003で削除関数・期限切れ認証情報の表を作り、004でSupabase Cronの`hiragana-purge-empty-participants`を登録します。現在の環境には2026年11月14日に両方を適用し、ジョブが有効なことを確認しました。スケジュールは`0 * * * *`（毎時0分）、対象は登録から24時間以上で写真が0枚の未提出IDです。Azure App Serviceの稼働状態には依存しません。Supabase DB自体が休止している間は実行されません。
+
+新しいアプリを公開する前に003を適用してください。004を適用すると次回の毎時実行から削除が始まります。003・004の適用操作では、その場で削除関数を呼び出しません。写真を登録する処理が行をロック中なら削除を見送り、写真が確定した後は対象外になります。削除と期限切れ認証情報の保存は同じトランザクションで行います。
+
+ジョブの状態と実行履歴はSupabaseのCron画面、またはSQL Editorで確認できます。
+
+```sql
+SELECT jobid, jobname, schedule, active
+FROM cron.job WHERE jobname = 'hiragana-purge-empty-participants';
+
+SELECT status, start_time, end_time, return_message
+FROM cron.job_run_details
+WHERE jobid IN (SELECT jobid FROM cron.job WHERE jobname = 'hiragana-purge-empty-participants')
+ORDER BY start_time DESC LIMIT 10;
+```
+
+自動削除を停止する場合は、対象ジョブだけを無効にします。
+
+```sql
+SELECT cron.alter_job(jobid, active := false)
+FROM cron.job WHERE jobname = 'hiragana-purge-empty-participants';
+```
+
+削除処理を検証する`python scripts/verify_expiry_postgres.py`は、接続先DBに検証専用の一時スキーマを作り、その中で24時間の境界・写真の保護・同時登録・トランザクションのロールバックを検証してスキーマを削除します。本番の参加者・写真・Cronジョブは変更しません。
 
 ## Dockerを使う場合
 

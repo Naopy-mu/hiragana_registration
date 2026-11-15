@@ -24,6 +24,7 @@ class CommitUncertain(RuntimeError):
 
 class Participant(Base):
     __tablename__ = 'participants'
+    __table_args__ = {'sqlite_autoincrement': True}
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     registration_key_hash: Mapped[str] = mapped_column(String(64), unique=True)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
@@ -39,6 +40,13 @@ class Participant(Base):
     @property
     def participant_id(self):
         return f'P{self.id:03d}'
+
+
+class ExpiredRegistration(Base):
+    __tablename__ = 'expired_registrations'
+    registration_key_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class Page(Base):

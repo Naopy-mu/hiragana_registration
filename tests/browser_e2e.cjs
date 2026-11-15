@@ -52,11 +52,12 @@ fs.mkdirSync(output, { recursive: true });
 
     async function upload(number, replace = false) {
       await page.locator('#gallery-input').setInputFiles(path.join(root, 'local-data', 'fixtures', `photo-${String(number).padStart(2, '0')}.jpg`));
+      await page.locator('#capture-next-register').click();
       if (replace) {
         await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
         await page.locator('#confirm-accept').click();
       }
-      await page.locator('#upload-progress').waitFor({ state: 'hidden' });
+      await page.waitForFunction(() => document.getElementById('batch-progress').hidden && document.querySelectorAll('.queued-photo[data-status="saved"]').length > 0);
       await page.locator('#camera-button:not([disabled])').waitFor();
       assert.equal(await page.locator('#upload-error').isVisible(), false, await page.locator('#upload-error').textContent());
     }

@@ -2,11 +2,13 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#123d45">
   <meta name="referrer" content="no-referrer">
   <title>筆跡収集 | 研究参加ポータル</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/camera.js" defer></script>
+  <script src="/static/photo-queue.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -22,6 +24,7 @@
     <div id="boot" class="boot card"><span class="spinner" aria-hidden="true"></span>画面を準備しています…</div>
 
     <section id="registration-view" hidden>
+      <p class="small muted">写真を1枚も登録しないまま登録から24時間を過ぎると、参加者IDは自動削除されます。削除後は新しく参加登録してください。</p>
       <div class="intro"><p class="eyebrow">HANDWRITING RESEARCH</p><h1 id="study-title">あなたの手書きを、<br>研究につなぐ。</h1><p class="lead">同意後に用紙をダウンロードし、印刷・記入して撮影します。<br class="desktop-break">アカウントの作成は必要ありません。</p></div>
       <ol class="journey" aria-label="参加の流れ"><li class="active"><span>01</span>説明・同意</li><li><span>02</span>印刷・記入・撮影</li><li><span>03</span>確認・提出</li></ol>
       <div class="registration-layout">
@@ -31,6 +34,7 @@
     </section>
 
     <section id="participant-view" hidden>
+      <p class="small muted">写真が0枚の参加者IDは、登録から24時間経過後に自動削除され、再開リンクも使えなくなります。1枚以上登録したIDは、この自動削除の対象になりません。</p>
       <div class="participant-heading"><div><p class="eyebrow">YOUR COLLECTION</p><h1 id="participant-heading-title">用紙を撮影して登録</h1><p class="lead" id="participant-lead">用紙はどの順番からでも登録できます。</p></div><div class="id-badge"><span>あなたの参加者ID</span><strong id="participant-id"></strong></div></div>
       <section class="resume-card" aria-label="再開リンク"><div><strong>このページの再開リンクを保存</strong><p>このリンクを知っている人は、あなたの登録内容を開けます。他の人に共有しないでください。</p></div><button id="copy-link" class="button secondary compact" type="button">リンクをコピー</button><input id="resume-link" class="link-field" readonly aria-label="専用再開リンク"></section>
       <section id="worksheet-section" class="card worksheet-card" aria-labelledby="worksheet-title">
@@ -39,7 +43,15 @@
       </section>
       <div class="collection-layout">
         <div class="collection-main">
-          <section id="upload-section" class="card" aria-labelledby="upload-title"><div class="section-top"><span class="section-kicker">CAPTURE</span><span class="small muted">1枚ずつ登録</span></div><h2 id="upload-title">2. 記入した用紙を撮影</h2><p class="muted">四隅の黒丸と用紙の端、下部のQRコードがすべて入るように撮影します。</p><div class="capture-guide" aria-hidden="true"><div class="paper-illustration"><i></i><i></i><i></i><i></i><span class="paper-lines"></span><span class="paper-qr">▦</span></div><div><strong>四隅まで、くっきりと。</strong><p>用紙を1枚ずつ置き、真上から撮影。<br>手やスマホの影を避けてください。</p></div></div><div class="capture-actions"><button id="camera-button" class="button primary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5 6.5 8H4a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-2.5L16 5z"/><circle cx="12" cy="13" r="4"/></svg>カメラで撮影</button><button id="gallery-button" class="button secondary" type="button">撮影済み画像を選ぶ</button></div><input id="camera-input" type="file" accept="image/*" capture="environment" hidden><input id="gallery-input" type="file" accept="image/*" hidden><div id="upload-progress" class="upload-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span>QR・四隅・画質を確認し、補正しています…</div><div id="upload-error" class="notice error" role="alert" hidden></div><p class="small muted" id="upload-format-note">JPEG・PNGなどの画像を選択できます。HEICの場合はJPEGに変換してください。</p></section>
+          <section id="upload-section" class="card" aria-labelledby="upload-title"><div class="section-top"><span class="section-kicker">CAPTURE</span><span class="small muted">複数枚まとめて登録</span></div><h2 id="upload-title">2. 記入した用紙を撮影</h2><p class="muted">四隅の黒丸と用紙の端、下部のQRコードがすべて入るように撮影します。</p><div class="capture-guide" aria-hidden="true"><div class="paper-illustration"><i></i><i></i><i></i><i></i><span class="paper-lines"></span><span class="paper-qr">▦</span></div><div><strong>四隅まで、くっきりと。</strong><p>用紙を1枚ずつ置き、真上から撮影。<br>手やスマホの影を避けてください。</p></div></div><div class="capture-actions"><button id="camera-button" class="button primary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5 6.5 8H4a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-2.5L16 5z"/><circle cx="12" cy="13" r="4"/></svg>カメラで撮影</button><button id="gallery-button" class="button secondary" type="button">撮影済み画像を選ぶ</button></div><input id="camera-input" type="file" accept="image/*" capture="environment" hidden><input id="gallery-input" type="file" accept="image/*" multiple hidden><div id="upload-progress" class="upload-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span>QR・四隅・画質を確認し、補正しています…</div><div id="upload-error" class="notice error" role="alert" hidden></div><p class="small muted" id="capture-light-note">対応する端末では撮影時にフラッシュやライトを使用します。標準カメラを使う場合は、カメラ画面の⚡をオンにしてください。</p><p class="small muted" id="upload-format-note">JPEG・PNGなどの画像を選択できます。HEICの場合はJPEGに変換してください。</p></section>
+          <section id="photo-queue" class="card photo-queue" aria-labelledby="queue-title" hidden>
+            <div class="section-top"><span class="section-kicker">PHOTOS</span><span id="queue-count" class="count-pill">0枚が未登録</span></div><h2 id="queue-title">登録する写真</h2>
+            <p class="small muted">写真を追加してから、まとめて登録できます。未登録の写真はページを閉じると消えます。</p>
+            <ul id="queue-list" class="photo-queue-list" aria-label="追加した写真"></ul>
+            <div class="queue-actions"><button id="queue-camera" class="button secondary" type="button">続けて撮影</button><button id="queue-gallery" class="button secondary" type="button">写真を追加</button><button id="batch-register" class="button primary" type="button" disabled>まとめて登録（0枚）</button></div>
+            <div id="batch-progress" class="upload-progress" role="status" hidden><span class="spinner" aria-hidden="true"></span><span id="batch-progress-label"></span></div>
+            <p id="batch-status" class="small" role="status" aria-live="polite"></p>
+          </section>
           <section id="latest-preview" class="card preview-card" hidden><div class="section-top"><span class="section-kicker">CHECKED</span><span class="success-chip">登録できました</span></div><h2 id="latest-title">補正後のプレビュー</h2><p class="small muted">傾きと明るさを補正した画像です。文字の欠けや読みにくさがあれば、同じ用紙を撮り直して差し替えられます。</p><button id="preview-open" class="preview-open" type="button" aria-label="補正画像を拡大"><img id="latest-image" alt="直近に登録した用紙の補正画像"><span>タップして拡大 ↗</span></button></section>
           <section id="submitted-panel" class="card submitted-card" hidden><span class="submitted-icon" aria-hidden="true">✓</span><p class="eyebrow">SUBMITTED</p><h2>提出が完了しました</h2><p>ご協力ありがとうございます。<br>画像とPDFは研究者が回収できる状態で保存されました。</p><button id="download-pdf" class="button secondary" type="button">自分のPDFを確認する</button></section>
         </div>
@@ -62,7 +74,15 @@
     </section>
   </main>
   <footer class="site-footer"><span>筆跡収集 · 研究参加ポータル</span><span>専用リンクとデータは大切に保管してください。</span></footer>
+  <dialog id="camera-dialog" class="camera-dialog" aria-label="カメラで撮影" aria-describedby="camera-status">
+    <div class="camera-stage"><video id="camera-video" autoplay muted playsinline aria-label="背面カメラのプレビュー"></video></div>
+    <button id="camera-flash" class="camera-flash" type="button" aria-label="フラッシュの対応を確認しています" aria-pressed="false" data-available="false" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path class="camera-flash-bolt" d="m13.5 2-9 12h6l-1 8 10-13h-6z"/><path class="camera-flash-off" d="m3 3 18 18"/></svg></button>
+    <button id="camera-shutter" class="camera-shutter" type="button" aria-label="撮影" disabled autofocus><span class="sr-only">撮影</span></button>
+    <p id="camera-status" class="sr-only" role="status" aria-live="polite"></p>
+  </dialog>
+  <dialog id="flash-confirm-dialog" class="confirm-dialog" aria-labelledby="flash-confirm-title" aria-describedby="flash-confirm-description"><h2 id="flash-confirm-title">フラッシュをオフにしますか？</h2><p id="flash-confirm-description">暗い場所では文字やQRコードが読み取りにくくなることがあります。</p><div class="dialog-actions"><button id="flash-confirm-cancel" class="button secondary" type="button" autofocus>オンのまま</button><button id="flash-confirm-off" class="button primary" type="button">オフにする</button></div></dialog>
   <dialog id="preview-dialog" class="image-dialog"><div class="dialog-heading"><strong id="dialog-image-title">補正画像</strong><button id="close-preview" class="button secondary compact" type="button">閉じる ×</button></div><img id="dialog-image" alt="拡大した補正画像"></dialog>
+  <dialog id="capture-next-dialog" class="confirm-dialog" aria-labelledby="capture-next-title"><h2 id="capture-next-title">写真を追加しました</h2><p id="capture-next-count"></p><div class="dialog-actions"><button id="capture-next-continue" class="button secondary" type="button" autofocus>続けて撮影</button><button id="capture-next-register" class="button primary" type="button">まとめて登録</button></div><button id="capture-next-review" class="text-button capture-next-review" type="button">写真を確認する</button></dialog>
   <dialog id="confirm-dialog" class="confirm-dialog"><h2 id="confirm-title">画像を差し替えますか？</h2><p id="confirm-description"></p><div class="dialog-actions"><button id="confirm-cancel" class="button secondary" type="button">キャンセル</button><button id="confirm-accept" class="button primary" type="button">差し替える</button></div></dialog>
 </body>
 </html>

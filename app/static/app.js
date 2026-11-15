@@ -1,10 +1,11 @@
 "use strict";
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { config: null, participant: null, token: null, busy: false, worksheetBusy: false, csrf: null, participants: [], selected: new Set(), previewObjectUrl: null, worksheetRevision: null, worksheetDraft: null, revisionBusy: false };
+  const state = { config: null, participant: null, token: null, busy: false, collecting: false, worksheetBusy: false, csrf: null, participants: [], selected: new Set(), previewObjectUrl: null, worksheetRevision: null, worksheetDraft: null, revisionBusy: false };
   const storage = {
     get(store, key) { try { return window[store].getItem(key); } catch { return null; } },
-    set(store, key, value) { try { window[store].setItem(key, value); } catch { /* Private browsing can disable storage. */ } }
+    set(store, key, value) { try { window[store].setItem(key, value); } catch { /* Private browsing can disable storage. */ } },
+    remove(store, key) { try { window[store].removeItem(key); } catch { /* Private browsing can disable storage. */ } }
   };
   const initialToken = location.hash.slice(1);
   if (initialToken) {
@@ -39,13 +40,28 @@
     if (!response.ok) {
       let data; try { data = await response.json(); } catch { data = {}; }
       const error = new Error(errorText(data, response.status));
-      error.status = response.status; error.detail = data.detail; throw error;
+      error.status = response.status; error.detail = data.detail;
+      if (error.status === 410 && error.detail?.code === "registration_expired") resetExpiredRegistration(error.message);
+      throw error;
     }
     return binary ? response.blob() : response.status === 204 ? {} : response.json();
   }
   function showView(name) {
+    if (name !== "participant") camera.stop();
     for (const view of ["registration", "participant", "researcher"]) $(view + "-view").hidden = view !== name;
     $("boot").hidden = true;
+  }
+  function resetExpiredRegistration(text) {
+    state.token = null; state.participant = null; state.registrationKey = null;
+    storage.remove("sessionStorage", "handwriting_resume_token");
+    storage.remove("localStorage", "handwriting_registration_key");
+    if (state.previewObjectUrl) { URL.revokeObjectURL(state.previewObjectUrl); state.previewObjectUrl = null; }
+    $("resume-link").value = "";
+    $("latest-preview").hidden = true;
+    $("consent-checkbox").checked = false; $("consent-checkbox").disabled = false;
+    $("register-button").disabled = true;
+    showView("registration"); message("app-error", text);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
   function dateParts(value) {
     const d = new Date(value);
@@ -62,9 +78,13 @@
   }
   function setParticipantBusy(busy) {
     state.busy = busy;
-    $("camera-button").disabled = busy; $("gallery-button").disabled = busy;
+    const submitted = state.participant?.status === "submitted";
+    const locked = busy || state.collecting || submitted;
+    $("camera-button").disabled = locked; $("gallery-button").disabled = locked;
+    photoQueue.setBusy(locked);
     $("upload-section").setAttribute("aria-busy", String(busy));
-    $("submit-button").disabled = busy || !state.participant || state.participant.missing_pages.length > 0 || state.participant.status === "submitted";
+    $("submit-button").disabled = locked || !state.participant || state.participant.missing_pages.length > 0 || photoQueue.hasPending;
+    if (state.participant) $("submit-hint").textContent = submitted ? "提出済みです。" : photoQueue.hasPending ? "未登録の写真があります。先にまとめて登録するか、一覧から外してください。" : state.participant.missing_pages.length ? "すべての必須ページがそろうと提出できます。" : "プレビューを確認して、提出してください。";
   }
   function resumeUrl() { return `${location.origin}/#${state.token}`; }
   function renderParticipant(participant) {
@@ -75,6 +95,7 @@
     $("participant-id").textContent = participant.participant_id;
     $("resume-link").value = resumeUrl();
     const submitted = participant.status === "submitted";
+    if (submitted) camera.stop();
     $("participant-heading-title").textContent = submitted ? "ご協力ありがとうございます" : "用紙を撮影して登録";
     $("participant-lead").textContent = submitted ? "提出済みのデータを確認できます。" : "用紙をダウンロードし、印刷・記入してから撮影してください。用紙はどの順番からでも登録できます。";
     const worksheet = participant.worksheet;
@@ -127,46 +148,95 @@
     return new Promise(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue === "accept"), { once: true }));
   }
   async function uploadFile(file) {
-    if (!file || state.busy) return;
     const maxMb = state.config.max_upload_mb || 25;
-    if (file.size > maxMb * 1024 * 1024) { message("upload-error", `画像は${maxMb}MB以内にしてください。スマートフォンの撮影設定を確認してください。`); return; }
-    message("upload-error", ""); message("app-error", "");
-    setParticipantBusy(true); $("upload-progress").hidden = false;
+    if (file.size > maxMb * 1024 * 1024) throw new Error(`画像は${maxMb}MB以内にしてください。`);
     const send = (replace, expectedVersion) => {
       const form = new FormData(); form.append("file", file); form.append("replace", String(replace));
       if (expectedVersion !== undefined) form.append("expected_version", String(expectedVersion));
       return api("/api/participant/pages", { method: "POST", body: form, participant: true });
     };
-    try {
-      let result;
-      try { result = await send(false); }
-      catch (error) {
-        if (error.status !== 409 || error.detail?.code !== "duplicate_page") throw error;
-        $("upload-progress").hidden = true;
-        const yes = await confirmAction("登録済みのページです", `ページ ${error.detail.page_number || ""}（${error.detail.qr_code}）を新しい写真に差し替えますか？新しい画像の確認と保存が完了した後に更新されます。`, "差し替える");
-        if (!yes) { announce("差し替えをキャンセルしました。元の画像は保持されています。"); return; }
-        $("upload-progress").hidden = false;
-        result = await send(true, error.detail.version);
-      }
-      if (result.participant) renderParticipant(result.participant); else await loadParticipant();
-      const page = result.page;
-      if (page) {
-        const blob = await blobForPage(page);
-        if (state.previewObjectUrl) URL.revokeObjectURL(state.previewObjectUrl);
-        state.previewObjectUrl = URL.createObjectURL(blob);
-        $("latest-image").src = state.previewObjectUrl;
-        $("latest-title").textContent = `ページ ${page.page_number} · ${page.qr_code}`;
-        $("latest-preview").hidden = false;
-        $("preview-open").onclick = () => openPagePreview(page);
-        announce(`ページ ${page.page_number}を登録しました。補正後の画像を確認してください。`);
-      }
-    } catch (error) {
-      message("upload-error", error.message);
-      if (error.status === 409) { try { await loadParticipant(); } catch { /* Keep the original explanation. */ } }
-    } finally {
-      $("upload-progress").hidden = true; setParticipantBusy(false);
-      $("camera-input").value = ""; $("gallery-input").value = "";
+    let result;
+    try { result = await send(false); }
+    catch (error) {
+      if (error.status !== 409 || error.detail?.code !== "duplicate_page") throw error;
+      const yes = await confirmAction("登録済みのページです", `ページ ${error.detail.page_number || ""}（${error.detail.qr_code}）を新しい写真に差し替えますか？新しい画像の確認と保存が完了した後に更新されます。`, "差し替える");
+      if (!yes) return { skipped: true };
+      result = await send(true, error.detail.version);
     }
+    // A successful save is final even if a later preview refresh fails.
+    return result;
+  }
+
+  async function registerQueuedPhotos() {
+    if (state.busy || state.collecting || !state.token || !state.participant || state.participant.status === "submitted") return;
+    const entries = photoQueue.pending.slice();
+    if (!entries.length) return;
+    const token = state.token;
+    let saved = 0, failed = 0, skipped = 0, lastPage = null;
+    message("upload-error", ""); message("app-error", "");
+    $("batch-status").textContent = "";
+    setParticipantBusy(true); $("batch-progress").hidden = false;
+    try {
+      for (const [index, entry] of entries.entries()) {
+        if (state.token !== token || state.participant?.status === "submitted") break;
+        $("batch-progress-label").textContent = `${index + 1} / ${entries.length}枚目のQR・四隅・画質を確認しています…`;
+        photoQueue.mark(entry, "uploading");
+        try {
+          const result = await uploadFile(entry.file);
+          if (result.skipped) { photoQueue.mark(entry, "skipped"); skipped++; continue; }
+          photoQueue.mark(entry, "saved", { page: result.page }); saved++;
+          if (result.page) lastPage = result.page;
+          if (result.participant) renderParticipant(result.participant);
+        } catch (error) {
+          photoQueue.mark(entry, "failed", { error: error.message }); failed++;
+          if (error.status === 401 || error.status === 410 || error.detail?.code === "already_submitted") break;
+        }
+      }
+      if (state.token === token) {
+        try { await loadParticipant(); }
+        catch { message("upload-error", "登録結果の一覧を更新できませんでした。登録済みの写真は保存されています。未登録の写真がある場合は、このページを閉じずに再試行してください。"); }
+        if (lastPage && state.participant?.status !== "submitted") {
+          try {
+            const blob = await blobForPage(lastPage);
+            if (state.previewObjectUrl) URL.revokeObjectURL(state.previewObjectUrl);
+            state.previewObjectUrl = URL.createObjectURL(blob);
+            $("latest-image").src = state.previewObjectUrl;
+            $("latest-title").textContent = `ページ ${lastPage.page_number} · ${lastPage.qr_code}`;
+            $("latest-preview").hidden = false;
+            $("preview-open").onclick = () => openPagePreview(lastPage);
+          } catch { message("upload-error", "写真の登録は完了しましたが、補正プレビューを取得できませんでした。登録状況の「確認」から開き直してください。"); }
+        }
+      }
+    } finally {
+      $("batch-progress").hidden = true; setParticipantBusy(false);
+      const parts = [`${saved}枚を登録しました。`];
+      if (failed) parts.push(`${failed}枚は未登録です。理由を確認して再試行できます。`);
+      if (skipped) parts.push(`${skipped}枚の差し替えを見送りました。`);
+      $("batch-status").textContent = parts.join(" ");
+      announce(parts.join(" "));
+    }
+  }
+
+  function addPhotos(files, source) {
+    if (state.busy || state.collecting || state.participant?.status === "submitted") return;
+    const { added, rejected } = photoQueue.add(files, state.config.max_upload_mb || 25);
+    message("upload-error", rejected.join(" "));
+    if (!added.length) return;
+    $("capture-next-count").textContent = `登録待ちの写真は${photoQueue.pending.length}枚です。`;
+    $("capture-next-continue").textContent = source === "gallery" ? "続けて選ぶ" : "続けて撮影";
+    $("capture-next-dialog").dataset.source = source;
+    $("capture-next-dialog").showModal();
+  }
+
+  async function capturePhoto() {
+    if (state.busy || state.collecting || state.participant?.status === "submitted") return;
+    message("upload-error", "");
+    if (!camera.supported) { $("camera-input").click(); return; }
+    state.collecting = true; setParticipantBusy(false);
+    let file;
+    try { file = await camera.open(); }
+    finally { state.collecting = false; setParticipantBusy(state.busy); }
+    if (file) addPhotos([file], "camera");
   }
   async function download(blob, filename) {
     const url = URL.createObjectURL(blob); const anchor = make("a"); anchor.href = url; anchor.download = filename; document.body.append(anchor); anchor.click(); anchor.remove();
@@ -187,7 +257,7 @@
     finally { state.busy = false; $("register-button").disabled = !$("consent-checkbox").checked; $("register-button").textContent = "同意して参加する →"; if (state.participant) setParticipantBusy(false); }
   }
   async function submit() {
-    if (state.busy || !state.participant || state.participant.missing_pages.length) return;
+    if (state.busy || state.collecting || photoQueue.hasPending || !state.participant || state.participant.missing_pages.length) return;
     const yes = await confirmAction("すべてのページを提出しますか？", "設定されたページ順でPDFを作成します。提出後は画像を変更できません。", "提出する");
     if (!yes) return;
     setParticipantBusy(true); $("submit-button").textContent = "PDFを作成しています…"; message("app-error", "");
@@ -300,8 +370,32 @@
     try { await navigator.clipboard.writeText(resumeUrl()); $("copy-link").textContent = "コピーしました ✓"; announce("再開リンクをコピーしました。安全な場所に保存してください。"); }
     catch { $("resume-link").focus(); $("resume-link").select(); announce("再開リンクを選択しました。コピーして保存してください。"); }
   });
-  $("camera-button").addEventListener("click", () => $("camera-input").click()); $("gallery-button").addEventListener("click", () => $("gallery-input").click());
-  $("camera-input").addEventListener("change", e => uploadFile(e.target.files[0])); $("gallery-input").addEventListener("change", e => uploadFile(e.target.files[0]));
+  const photoQueue = new window.WorksheetPhotoQueue({
+    onChange: () => setParticipantBusy(state.busy),
+    onPreview: async entry => {
+      if (entry.page) { await openPagePreview(entry.page); return; }
+      if (!entry.file) return;
+      const url = URL.createObjectURL(entry.file);
+      $("dialog-image").src = url; $("dialog-image-title").textContent = entry.name;
+      $("preview-dialog").showModal();
+      $("preview-dialog").addEventListener("close", () => URL.revokeObjectURL(url), { once: true });
+    }
+  });
+  const camera = new window.WorksheetCamera({ onError: text => message("upload-error", text) });
+  $("camera-button").addEventListener("click", capturePhoto);
+  $("queue-camera").addEventListener("click", capturePhoto);
+  $("gallery-button").addEventListener("click", () => $("gallery-input").click());
+  $("queue-gallery").addEventListener("click", () => $("gallery-input").click());
+  $("camera-input").addEventListener("change", event => { const files = Array.from(event.target.files); event.target.value = ""; addPhotos(files, "camera"); });
+  $("gallery-input").addEventListener("change", event => { const files = Array.from(event.target.files); event.target.value = ""; addPhotos(files, "gallery"); });
+  $("batch-register").addEventListener("click", registerQueuedPhotos);
+  $("capture-next-continue").addEventListener("click", () => {
+    const source = $("capture-next-dialog").dataset.source;
+    $("capture-next-dialog").close();
+    if (source === "gallery") $("gallery-input").click(); else capturePhoto();
+  });
+  $("capture-next-register").addEventListener("click", () => { $("capture-next-dialog").close(); registerQueuedPhotos(); });
+  $("capture-next-review").addEventListener("click", () => { $("capture-next-dialog").close(); $("photo-queue").scrollIntoView({ block: "start", behavior: "smooth" }); });
   $("submit-button").addEventListener("click", submit);
   $("revision-file").addEventListener("change", () => { clearWorksheetDraft(); message("revision-message", ""); });
   $("inspect-worksheet").addEventListener("click", inspectWorksheet);
@@ -367,7 +461,7 @@
       if (location.pathname.replace(/\/$/, "") === "/researcher") { await researcherInit(); return; }
       if (state.token) {
         try { await loadParticipant(); }
-        catch (error) { showView("registration"); $("register-button").disabled = true; $("consent-checkbox").disabled = true; message("app-error", error.status === 401 ? "再開リンクが無効です。保存してあるリンクを確認して開き直してください。参加者IDだけでは再開できません。" : error.message + " ページを再読み込みして再開してください。"); }
+        catch (error) { if (error.status === 410 && error.detail?.code === "registration_expired") return; showView("registration"); $("register-button").disabled = true; $("consent-checkbox").disabled = true; message("app-error", error.status === 401 ? "再開リンクが無効です。保存してあるリンクを確認して開き直してください。参加者IDだけでは再開できません。" : error.message + " ページを再読み込みして再開してください。"); }
       } else showView("registration");
     } catch (error) { $("boot").hidden = true; message("app-error", error.message + " ページを再読み込みしてください。"); }
   }

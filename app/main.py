@@ -25,7 +25,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.database import CommitUncertain, Database, Page, Participant, StudyRevision, StudyState, now, utc_iso
+from app.database import CommitUncertain, Database, ExpiredRegistration, Page, Participant, StudyRevision, StudyState, now, utc_iso
 from app.revisions import RevisionConflict, RevisionMissing, RevisionNotProduction, StudyRegistry
 from app.security import create_session, digest_token, read_session, registration_token, verify_password
 from app.settings import ROOT, Settings
@@ -37,6 +37,10 @@ log = logging.getLogger('handwriting')
 
 def fail(status, code, message, **extra):
     raise HTTPException(status, detail={'code': code, 'message': message, **extra})
+
+
+def registration_expired():
+    fail(410, 'registration_expired', 'この参加者IDは、写真が登録されないまま24時間を過ぎたため削除されました。研究説明を確認して、新しく参加登録してください。')
 
 
 class Registration(BaseModel):
@@ -120,7 +124,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
-        response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
         if settings.cookie_secure:
             response.headers['Strict-Transport-Security'] = 'max-age=31536000'
         return response
@@ -131,6 +135,8 @@ def create_app(settings: Settings | None = None, storage_override=None):
         with db.read() as s:
             participant = s.scalar(select(Participant).where(Participant.token_hash == digest_token(authorization[7:])))
             if not participant:
+                if s.scalar(select(ExpiredRegistration).where(ExpiredRegistration.token_hash == digest_token(authorization[7:]))):
+                    registration_expired()
                 fail(401, 'unauthorized', '再開リンクを確認してください。')
             return participant
 
@@ -192,6 +198,8 @@ def create_app(settings: Settings | None = None, storage_override=None):
         key_hash = digest_token(key)
         try:
             with db.write() as s:
+                if s.get(ExpiredRegistration, key_hash):
+                    registration_expired()
                 state = s.scalar(select(StudyState).where(StudyState.id == 1).with_for_update())
                 current_manifest = json.loads(s.get(StudyRevision, state.active_revision_id).manifest_json)
                 if not body.consent or body.consent_version != current_manifest['consent_version']:
@@ -203,10 +211,12 @@ def create_app(settings: Settings | None = None, storage_override=None):
                         worksheet_revision_id=state.active_revision_id)
                     s.add(participant)
                     s.flush()
-        except IntegrityError:
+        except (IntegrityError, CommitUncertain):
             with db.read() as s:
                 participant = s.scalar(select(Participant).where(Participant.registration_key_hash == key_hash))
                 if participant is None:
+                    if s.get(ExpiredRegistration, key_hash):
+                        registration_expired()
                     raise
         if not hmac.compare_digest(participant.token_hash, digest_token(token)):
             fail(409, 'registration_secret_changed', '登録用のサーバー鍵が変更されています。保存した再開リンクから開いてください。')
@@ -246,6 +256,8 @@ def create_app(settings: Settings | None = None, storage_override=None):
         try:
             with db.write() as s:
                 current = s.scalar(select(Participant).where(Participant.id == participant.id).with_for_update())
+                if current is None:
+                    registration_expired()
                 if current.status == 'submitted':
                     fail(409, 'already_submitted', '提出済みのため変更できません。')
                 existing = s.scalar(select(Page).where(Page.submission_id == current.submission_id, Page.qr_code == processed.qr_code))
@@ -302,6 +314,8 @@ def create_app(settings: Settings | None = None, storage_override=None):
         try:
             with db.write() as s:
                 current = s.scalar(select(Participant).where(Participant.id == participant.id).with_for_update())
+                if current is None:
+                    registration_expired()
                 pages = get_pages(s, current)
                 missing = participant_data(current, pages)['missing_pages']
                 if missing:
