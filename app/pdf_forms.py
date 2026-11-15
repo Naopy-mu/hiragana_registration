@@ -7,6 +7,7 @@ import re
 import cv2
 import fitz
 import numpy as np
+import zxingcpp
 
 from app.imaging import ImageValidationError, _decode_qr, _marker_candidates
 
@@ -23,6 +24,32 @@ class PdfFormError(ValueError):
 def render_page(page: fitz.Page, dpi: int = 200) -> np.ndarray:
     pixmap = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), colorspace=fitz.csGRAY, alpha=False)
     return np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width)
+
+
+def _decode_page_qr(page, gray, page_number):
+    # Re-render from PDF data: enlarging a 200dpi bitmap cannot recover small modules.
+    # Only difficult pages need the extra resolution; retain one bitmap at a time.
+    for dpi in (200, 400, 600):
+        work = gray if dpi == 200 else render_page(page, dpi)
+        try:
+            symbols = zxingcpp.read_barcodes(work, formats=zxingcpp.BarcodeFormat.QRCode,
+                                            try_downscale=False, text_mode=zxingcpp.TextMode.Plain)
+            if len(symbols) > 1:
+                raise PdfFormError('pdf_multiple_qr', f'{page_number}ページ目に複数のQRがあります。用紙識別用QRを1つにしてください。')
+            if symbols:
+                symbol = symbols[0]
+                position = symbol.position
+                points = np.array([[p.x, p.y] for p in (position.top_left, position.top_right,
+                                                       position.bottom_right, position.bottom_left)], np.float32)
+                # Marker detection and calibration use the original 200dpi coordinates.
+                return symbol.text, points * (200 / dpi)
+        finally:
+            del work
+    # Preserve forms that the existing OpenCV reader can decode independently.
+    try:
+        return _decode_qr(gray)
+    except ImageValidationError as exc:
+        raise PdfFormError('pdf_qr_unreadable', f'{page_number}ページ目のQRコードを読めません。QRを含む高画質の原本PDFを選んでください。') from exc
 
 
 def _ordered_corner_marks(candidates, width, height):
@@ -95,10 +122,7 @@ def analyze_pdf(data: bytes) -> dict:
             if abs(width_mm - 210) > 1 or abs(height_mm - 297) > 1:
                 raise PdfFormError('pdf_not_a4', f'{index}ページ目がA4縦ではありません。全ページをA4縦にした原本PDFを選んでください。')
             gray = render_page(page)
-            try:
-                code, qr = _decode_qr(gray)
-            except ImageValidationError as exc:
-                raise PdfFormError('pdf_qr_unreadable', f'{index}ページ目のQRコードを読めません。QRを含む高画質の原本PDFを選んでください。') from exc
+            code, qr = _decode_page_qr(page, gray, index)
             if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', code):
                 raise PdfFormError('pdf_unsafe_qr', f'{index}ページ目のQRは英数字・ハイフン・下線、80文字以内にしてください。')
             ex, ey = qr[1] - qr[0], qr[3] - qr[0]
