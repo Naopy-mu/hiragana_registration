@@ -80,6 +80,15 @@ class StudyState(Base):
     activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class WorksheetSubmission(Base):
+    __tablename__ = 'worksheet_submissions'
+    submission_id: Mapped[str] = mapped_column(ForeignKey('participants.submission_id', ondelete='CASCADE'), primary_key=True)
+    worksheet_id: Mapped[str] = mapped_column(ForeignKey('study_revisions.id'), primary_key=True)
+    pdf_path: Mapped[str] = mapped_column(Text)
+    blank_qrs_json: Mapped[str] = mapped_column(Text, default='[]')
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Database:
     def __init__(self, settings):
         url = settings.database_url

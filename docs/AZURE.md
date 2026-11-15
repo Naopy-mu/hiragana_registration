@@ -5,7 +5,7 @@
 ## 1. 公開前にローカルでそろえる
 
 1. 提供原本`resources/worksheets/hiragana_collection_a4.pdf`と、全8ページのQR・順序・黒丸位置を記録した`config/pages.study.json`を初期設定として使用します。同意文は提供済みの版`2026-11-10-v1`です。`pages.test.json`と3ページのテスト用紙は公開用ではありません。以降は研究者画面の「配布用紙の管理」でPDFを複数登録し、配布するPDFをチェックして確定します。
-2. READMEのSupabase手順に従い、SQL Editorで`migrations/001_initial.sql`、`migrations/002_worksheet_revisions.sql`、`migrations/003_expire_empty_participants.sql`を順に実行し、非公開の`handwriting-private`バケットを確認します。既存環境には未適用のSQLだけを追加実行します。004は写真0枚のIDの自動削除を有効にするSQLです（下記参照）。
+2. READMEのSupabase手順に従い、SQL Editorで001・002・003と`migrations/005_individual_worksheet_submissions.sql`を実行し、非公開の`handwriting-private`バケットを確認します。既存環境には未適用のSQLだけを追加実行します。004は写真0枚のIDの自動削除を有効にするSQLです（下記参照）。005はPDFごとの提出と白紙ページの記録用テーブルを追加します。現在の接続先には005も適用済みです。
 3. `scripts/set_password.py`で本番の研究者パスワードハッシュを生成します。開発用パスワードをそのまま流用しないでください。
 4. 次の鍵生成コマンドを2回実行し、研究者セッション用の`SESSION_SECRET`と、参加者リンク用の`PARTICIPANT_TOKEN_SECRET`へ別々の値を設定します。パスワード管理ツールなどで保管し、参加者用の鍵は収集期間中に変更しません。
 
@@ -105,7 +105,9 @@ az webapp deploy --name $researchApp --resource-group $researchGroup --src-path 
 
 `package_deploy.py`はアプリのコード・静的ファイル・設定JSON・`resources/worksheets/`の初期配布PDF・requirements.txt・startup.shをまとめます。`.env`、仮想環境、参加者の元写真、ローカルDB、テスト成果物は含めません。`config/pages.study.json`と`hiragana_collection_a4.pdf`がZIPに含まれていることを確認します。原本PDFは認証を通したAPIから配布します。再デプロイ時は`--output artifacts/deploy-02.zip`のように別名を指定してください。既存ZIPは自動で上書きしません。
 
-研究者画面から登録したPDFはSupabaseの非公開Storage、PDFごとの設定と配布対象の選択はPostgreSQLへ保存します。複数のPDFを保管し、任意の組み合わせを選べます。App Serviceの一時ディスクやデプロイZIPへ書き戻さないため、再起動・再デプロイ・複数workerでも保持されます。選択の変更は新規登録者から適用し、既存参加者のPDF一覧と必要ページは登録時の版を維持します。この複数PDF機能は既存の用紙版テーブルを使い、追加のSQL適用は不要です。
+研究者画面から登録したPDFはSupabaseの非公開Storage、PDFごとの設定と配布対象の選択はPostgreSQLへ保存します。複数のPDFを保管し、任意の組み合わせを選べます。選択の変更は新規登録者から適用し、既存参加者のPDF一覧と対象ページは登録時の版を維持します。
+
+被験者は各PDFを独立して提出でき、写真がないページは白紙になります。005で追加した`worksheet_submissions`へ提出PDFの保存先・白紙QR一覧・提出日時を記録します。最初の個別提出時に参加者の提出日時も設定するため、写真0枚の白紙提出でも自動削除の対象にはなりません。すべての用紙を提出した場合は結合PDFも作成します。App Serviceの一時ディスクやデプロイZIPへ研究データを書き戻しません。
 
 ビルドが終わったら **概要 → 再起動** を実行し、 **監視 → ログストリーム** を開いて起動エラーがないことを確認します。環境変数や秘密値をログに貼り付けないでください。CLIでログを開く場合は次です。
 
@@ -119,10 +121,10 @@ az webapp log tail --name $researchApp --resource-group $researchGroup
 1. `https://<APP_NAME>.azurewebsites.net/api/health`を開き正常応答を確認します。
 2. スマホで`https://<APP_NAME>.azurewebsites.net`を開き、同意・参加者番号発行・専用リンクの再開を確認します。同意後に記入用紙PDFをダウンロードでき、未認証では`/api/participant/worksheet`が拒否されることを確認します。
 3. ダウンロードした用紙をA4・実際のサイズ（100%）・片面で印刷し、記入します。実際の全ページを順不同で撮影し、プレビューが正しい向きか、薄い鉛筆線や濁点が残っているか、外枠が切れていないかを確認します。
-4. 途中で1枚不足したときの提出制限と、同じQRの差し替えを確認し、全ページをそろえて提出します。
+4. 同じQRの写真の差し替えを確認します。未登録ページを残して1つのPDFを提出し、その位置が白紙になること、提出済みの用紙だけが変更不可となり、他の用紙は引き続き登録・提出できることを確認します。
 5. `/researcher`へ本番パスワードでログインし、対象者と種類を指定してZIPをダウンロードします。PDF順、画像の対応、選ばなかった種類が入っていないことを確認します。
 6. 別ブラウザの未認証状態で研究者APIを開き、拒否されることを確認します。SupabaseのStorageでバケットが非公開のままか確認します。
-7. 研究者画面でPDFを複数登録し、配布するものをチェックして確定します。新規参加者に①・②…の個別ダウンロードボタンが表示され、すべてのPDFの必要ページが提出対象になることを確認します。登録済み参加者のPDF一覧が以前のままであることも確認します。同時に選択するPDF間でQRを重複させないでください。
+7. 研究者画面でPDFを複数登録し、配布するものをチェックして確定します。新規参加者に①・②…のダウンロード・個別提出ボタンが表示され、一部の用紙だけ提出した人も研究者画面で回収できることを確認します。CSVの`page_status=blank`で白紙を区別できます。登録済み参加者のPDF一覧が以前のままであることも確認します。同時に選択するPDF間でQRを重複させないでください。
 
 本番の実写真・Supabase・Azureの資格情報がそろうまでは、この公開先での実機確認は未実施です。ローカルのテストだけを根拠に本番の原本寸法やスマホ全機種を保証しません。
 

@@ -83,8 +83,10 @@
     $("camera-button").disabled = locked; $("gallery-button").disabled = locked;
     photoQueue.setBusy(locked);
     $("upload-section").setAttribute("aria-busy", String(busy));
-    $("submit-button").disabled = locked || !state.participant || state.participant.missing_pages.length > 0 || photoQueue.hasPending;
-    if (state.participant) $("submit-hint").textContent = submitted ? "提出済みです。" : photoQueue.hasPending ? "未登録の写真があります。先にまとめて登録するか、一覧から外してください。" : state.participant.missing_pages.length ? "すべての必須ページがそろうと提出できます。" : "プレビューを確認して、提出してください。";
+    $("submit-button").disabled = locked || !state.participant || photoQueue.hasPending;
+    for (const button of document.querySelectorAll(".worksheet-submit")) button.disabled = locked || photoQueue.hasPending;
+    for (const button of document.querySelectorAll(".worksheet-result-download")) button.disabled = busy || state.collecting;
+    if (state.participant) $("submit-hint").textContent = submitted ? "提出済みです。" : photoQueue.hasPending ? "一覧の写真を先に登録するか、一覧から外してください。" : state.participant.worksheet_submissions?.length > 1 ? "PDFごとに提出できます。未登録のページは白紙になります。" : "未登録のページは白紙として提出できます。";
   }
   function resumeUrl() { return `${location.origin}/#${state.token}`; }
   function renderParticipant(participant) {
@@ -105,27 +107,26 @@
     renderWorksheetDownloads(participant);
     $("upload-section").hidden = submitted;
     $("submitted-panel").hidden = !submitted;
-    $("submit-button").hidden = submitted;
-    $("page-count").textContent = `${participant.pages.length} / ${state.config.pages.length}`;
-    const required = state.config.pages.filter(p => p.required !== false);
-    const requiredMissing = participant.missing_pages.length;
-    const percent = required.length ? Math.round((required.length - requiredMissing) / required.length * 100) : 0;
+    $("submit-button").hidden = submitted || participant.worksheet_submissions?.length > 1;
+    const blankCodes = new Set((participant.worksheet_submissions || []).flatMap(file => file.blank_qr_codes));
+    $("page-count").textContent = `${participant.pages.length + blankCodes.size} / ${state.config.pages.length}`;
+    const percent = state.config.pages.length ? Math.round((participant.pages.length + blankCodes.size) / state.config.pages.length * 100) : 0;
     $("progress-fill").style.width = `${percent}%`;
     $("progress-fill").parentElement.setAttribute("aria-valuenow", String(percent));
-    $("progress-description").textContent = submitted ? "すべての必須ページを提出しました。" : requiredMissing ? `あと${requiredMissing}ページの登録が必要です。` : "必須ページがすべてそろいました。";
-    $("submit-hint").textContent = submitted ? "提出済みです。" : requiredMissing ? "すべての必須ページがそろうと提出できます。" : "プレビューを確認して、提出してください。";
+    $("progress-description").textContent = submitted ? `提出が完了しました。写真${participant.pages.length}ページ・白紙${blankCodes.size}ページです。` : `写真${participant.pages.length}ページを登録済み、${blankCodes.size}ページを白紙で提出済みです。未登録のページも白紙で提出できます。`;
     const list = $("page-list"); list.replaceChildren();
     for (const page of state.config.pages) {
       const saved = participant.pages.find(p => p.qr_code === page.qr_code);
       const row = make("li", "page-row" + (saved ? " complete" : ""));
-      row.append(make("span", "page-state", saved ? "✓" : String(page.page_number)));
+      row.append(make("span", "page-state", saved ? "✓" : blankCodes.has(page.qr_code) ? "白" : String(page.page_number)));
       const info = make("div", "page-info");
-      info.append(make("strong", "", page.label || `ページ ${page.page_number}`), make("small", "", page.qr_code + (page.required === false ? " · 任意" : "")));
+      info.append(make("strong", "", page.label || `ページ ${page.page_number}`), make("small", "", page.qr_code + (blankCodes.has(page.qr_code) ? " · 白紙で提出済み" : page.required === false ? " · 任意" : "")));
       row.append(info);
       if (saved) { const button = make("button", "", "確認"); button.type = "button"; button.setAttribute("aria-label", `${page.label || "ページ " + page.page_number}の補正画像を確認`); button.addEventListener("click", () => openPagePreview(saved)); row.append(button); }
-      else row.append(make("span", "missing-label", "未登録"));
+      else row.append(make("span", "missing-label", blankCodes.has(page.qr_code) ? "白紙で提出済み" : "未登録"));
       list.append(row);
     }
+    renderWorksheetSubmissions(participant);
     setParticipantBusy(state.busy);
   }
   async function loadParticipant() { renderParticipant(await api("/api/participant", { participant: true })); }
@@ -145,7 +146,28 @@
       button.addEventListener("click", () => downloadWorksheet(file, button));
       $("worksheet-downloads").append(button);
     }
-    if (files.length > 1) $("worksheet-file-title").textContent = `${files.length}種類のPDFをすべてダウンロードし、各用紙を記入・撮影してください。`;
+    if (files.length > 1) $("worksheet-file-title").textContent = `${files.length}種類のPDFがあります。それぞれ個別に提出できます。未登録のページは白紙になります。`;
+  }
+  function renderWorksheetSubmissions(participant) {
+    const files = participant.worksheet_submissions || [];
+    $("worksheet-submissions").hidden = files.length <= 1;
+    const list = $("worksheet-submission-list"); list.replaceChildren();
+    for (const file of files) {
+      const row = make("div", "worksheet-submission-row"); row.dataset.worksheetId = file.id; row.dataset.status = file.status;
+      const done = file.status === "submitted";
+      row.append(make("h3", "", `${file.number_label} ${file.original_name || file.title}`));
+      row.append(make("p", "small muted", done ? `提出済み · 写真${file.registered_pages}ページ／白紙${file.blank_pages}ページ` : `全${file.page_count}ページ中、写真${file.registered_pages}ページを登録済み。未登録の${file.missing_page_count}ページは白紙で提出します。`));
+      const button = make("button", `button ${done ? "secondary worksheet-result-download" : "primary worksheet-submit"}`, done ? `${file.number_label}の提出PDFを確認` : `${file.number_label}を提出する`);
+      button.type = "button";
+      button.addEventListener("click", done ? async () => {
+        if (state.busy || state.collecting) return;
+        setParticipantBusy(true);
+        try { await download(await api(file.pdf_url, { participant: true, binary: true }), `${participant.participant_id}_${String(file.number).padStart(2, "0")}.pdf`); }
+        catch (error) { message("app-error", error.message); }
+        finally { setParticipantBusy(false); }
+      } : () => submit(file));
+      row.append(button); list.append(row);
+    }
   }
   async function downloadWorksheet(worksheet, button) {
     if (state.worksheetBusy || !worksheet) return;
@@ -288,26 +310,34 @@
     } catch (error) { message("app-error", error.message); }
     finally { state.busy = false; $("register-button").disabled = !$("consent-checkbox").checked; $("register-button").textContent = "同意して参加する →"; if (state.participant) setParticipantBusy(false); }
   }
-  async function submit() {
-    if (state.busy || state.collecting || photoQueue.hasPending || !state.participant || state.participant.missing_pages.length) return;
-    const yes = await confirmAction("すべてのページを提出しますか？", "設定されたページ順でPDFを作成します。提出後は画像を変更できません。", "提出する");
-    if (!yes) return;
+  async function submit(file = null) {
+    if (state.busy || state.collecting || photoQueue.hasPending || !state.participant || state.participant.status === "submitted") return;
     setParticipantBusy(true); $("submit-button").textContent = "PDFを作成しています…"; message("app-error", "");
-    try { await api("/api/participant/submit", { method: "POST", participant: true }); await loadParticipant(); $("latest-preview").hidden = true; window.scrollTo({ top: 0, behavior: "smooth" }); announce("提出が完了しました。ご協力ありがとうございます。"); }
+    try {
+      const missing = file ? file.missing_page_count : state.config.pages.length - state.participant.pages.length;
+      const yes = await confirmAction(file ? `${file.number_label}を提出しますか？` : "この用紙を提出しますか？", `未登録の${missing}ページは白紙としてPDFに入ります。提出後は、この用紙の写真を変更できません。${file ? "他の未提出の用紙は引き続き登録・提出できます。" : ""}`, "白紙を含めて提出する");
+      if (!yes) return;
+      await api(file ? file.submit_url : "/api/participant/submit", { method: "POST", participant: true });
+      await loadParticipant(); $("latest-preview").hidden = true;
+      message("app-error", ""); announce(file ? `${file.number_label}の提出が完了しました。他の未提出の用紙は引き続き登録できます。` : "提出が完了しました。ご協力ありがとうございます。");
+      if (file) $("worksheet-submissions").scrollIntoView({ block: "start", behavior: "smooth" });
+      else window.scrollTo({ top: 0, behavior: "smooth" });
+    }
     catch (error) { message("app-error", error.message + " 提出状況を確認して、再度お試しください。"); try { await loadParticipant(); } catch { /* The server may still be offline. */ } }
     finally { setParticipantBusy(false); $("submit-button").textContent = "提出する →"; }
   }
   function renderResearchers() {
     $("researcher-content").hidden = false; $("login-panel").hidden = true; $("logout-button").hidden = false;
-    const submitted = state.participants.filter(p => p.status === "submitted").length;
+    const submitted = state.participants.filter(p => p.status === "submitted" || p.status === "partially_submitted").length;
     const stats = $("research-stats"); stats.replaceChildren();
-    for (const [label, count] of [["登録者", state.participants.length], ["提出済み", submitted], ["記入・撮影中", state.participants.length - submitted]]) { const el = make("div", "stat"); el.append(make("span", "", label)); const strong = make("strong", "", String(count)); strong.append(make("small", "", "人")); el.append(strong); stats.append(el); }
+    for (const [label, count] of [["登録者", state.participants.length], ["提出あり", submitted], ["提出なし", state.participants.length - submitted]]) { const el = make("div", "stat"); el.append(make("span", "", label)); const strong = make("strong", "", String(count)); strong.append(make("small", "", "人")); el.append(strong); stats.append(el); }
     const rows = $("participant-rows"); rows.replaceChildren();
     for (const participant of state.participants) {
       const row = make("tr"); const checkCell = make("td"); const checkbox = make("input"); checkbox.type = "checkbox"; checkbox.checked = state.selected.has(participant.participant_id); checkbox.setAttribute("aria-label", `${participant.participant_id}を選択`);
       checkbox.addEventListener("change", () => { if (checkbox.checked) state.selected.add(participant.participant_id); else state.selected.delete(participant.participant_id); if (state.selected.size) document.querySelector('input[name="export-scope"][value="selected"]').checked = true; updateSelection(); }); checkCell.append(checkbox);
       const [date, time] = dateParts(participant.registered_at); const dateCell = make("td", "", date); dateCell.append(make("span", "date", time));
-      const statusCell = make("td"); statusCell.append(make("span", "state-chip" + (participant.status === "submitted" ? " done" : ""), participant.status === "submitted" ? "提出済み" : participant.status === "processing" ? "処理中" : "登録中"));
+      const statusCell = make("td"); statusCell.append(make("span", "state-chip" + (participant.status === "submitted" ? " done" : ""), participant.status === "submitted" ? "提出済み" : participant.status === "partially_submitted" ? "一部提出" : "登録中"));
+      if (participant.total_worksheets) statusCell.append(make("span", "date", `${participant.submitted_worksheet_count} / ${participant.total_worksheets}用紙提出 · 白紙${participant.blank_page_count}ページ`));
       row.append(checkCell, make("td", "participant-code", participant.participant_id), dateCell, statusCell, make("td", "", `${participant.page_count} / ${participant.total_pages ?? state.config.pages.length}`)); rows.append(row);
     }
     $("empty-roster").hidden = state.participants.length > 0; updateSelection();
@@ -464,7 +494,7 @@
   });
   $("capture-next-register").addEventListener("click", () => { $("capture-next-dialog").close(); registerQueuedPhotos(); });
   $("capture-next-review").addEventListener("click", () => { $("capture-next-dialog").close(); $("photo-queue").scrollIntoView({ block: "start", behavior: "smooth" }); });
-  $("submit-button").addEventListener("click", submit);
+  $("submit-button").addEventListener("click", () => submit());
   $("revision-file").addEventListener("change", () => { message("revision-message", ""); revisionBusy(state.revisionBusy); });
   $("inspect-worksheet").addEventListener("click", inspectWorksheet);
   $("save-worksheet-selection").addEventListener("click", activateWorksheet);
@@ -496,7 +526,7 @@
     const types = [...document.querySelectorAll('input[name="export-type"]:checked')].map(el => el.value);
     if (!types.length) { message("export-message", "ファイルの種類を1つ以上選択してください。", true); return; }
     if (scope === "selected" && !state.selected.size) { message("export-message", "一覧で対象の参加者を選択してください。", true); return; }
-    if (scope === "submitted" && !state.participants.some(p => p.status === "submitted")) { message("export-message", "提出済みの参加者がいません。", true); return; }
+    if (scope === "submitted" && !state.participants.some(p => p.status === "submitted" || p.status === "partially_submitted")) { message("export-message", "提出された用紙がありません。", true); return; }
     $("export-button").disabled = true; $("export-button").textContent = "ZIPを準備しています…"; message("export-message", "");
     try { const blob = await api("/api/researcher/download", { method: "POST", csrf: true, binary: true, body: { scope, participant_ids: [...state.selected], types } }); await download(blob, "handwriting_collection.zip"); message("export-message", "選択したデータのダウンロードを開始しました。"); }
     catch (error) { message("export-message", error.message, true); }

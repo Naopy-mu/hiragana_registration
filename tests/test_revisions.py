@@ -422,7 +422,7 @@ def form_photos(separate_pdfs):
     import fitz
     from PIL import Image, ImageDraw
     photos = []
-    for data in separate_pdfs[:2]:
+    for data in separate_pdfs:
         with fitz.open(stream=data, filetype='pdf') as document:
             pixmap = document[0].get_pixmap(matrix=fitz.Matrix(2, 2))
             page = Image.frombytes('RGB', (pixmap.width, pixmap.height), pixmap.samples)
@@ -438,7 +438,7 @@ def form_photos(separate_pdfs):
     return photos
 
 
-def test_selected_forms_require_all_pages_and_submit_in_file_order(revision_harness, separate_pdfs, form_photos):
+def test_selected_forms_combine_in_file_order(revision_harness, separate_pdfs, form_photos):
     client, _, _, _ = revision_harness
     csrf = login(client)
     before = active(client)['active_revision_id']
@@ -449,7 +449,7 @@ def test_selected_forms_require_all_pages_and_submit_in_file_order(revision_harn
     assert first.status_code == 200, first.text
     assert first.json()['page']['page_number'] == 2
     assert first.json()['participant']['missing_pages'] == ['HIRA1-02']
-    assert client.post('/api/participant/submit', headers=auth).status_code == 409
+    assert client.get('/api/participant', headers=auth).json()['status'] == 'registered'
     second = client.post('/api/participant/pages', headers=auth, files={'file': ('form-b.jpg', form_photos[1], 'image/jpeg')})
     assert second.status_code == 200, second.text
     assert second.json()['page']['page_number'] == 1
@@ -458,3 +458,168 @@ def test_selected_forms_require_all_pages_and_submit_in_file_order(revision_harn
     document = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth).content))
     assert len(document.pages) == 2
     assert [entry.title for entry in document.outline] == ['1: HIRA1-02', '2: HIRA1-01']
+
+
+def partial_setup(harness, separate_pdfs):
+    client, _, _, _ = harness
+    csrf = login(client)
+    writer, output = PdfWriter(), io.BytesIO()
+    for source in separate_pdfs[:2]:
+        writer.add_page(PdfReader(io.BytesIO(source)).pages[0])
+    writer.write(output)
+    ids = [inspect(client, csrf, data)['draft_id'] for data in [output.getvalue(), separate_pdfs[2]]]
+    assert choose(client, csrf, ids, active(client)['active_revision_id']).status_code == 200
+    auth = register(client)
+    return client, csrf, auth, ids
+
+
+def test_independent_partial_submission_blanks_and_other_file_remains_editable(revision_harness, separate_pdfs, form_photos):
+    import csv
+    from zipfile import ZipFile
+    client, csrf, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    upload = lambda index: client.post('/api/participant/pages', headers=auth, files={'file': ('form.jpg', form_photos[index], 'image/jpeg')})
+    assert upload(0).status_code == 200
+    submitted = client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth)
+    assert submitted.status_code == 200, submitted.text
+    state = client.get('/api/participant', headers=auth).json()
+    assert state['status'] == 'partially_submitted'
+    assert [f['status'] for f in state['worksheet_submissions']] == ['submitted', 'registered']
+    assert state['worksheet_submissions'][0]['blank_qr_codes'] == ['HIRA1-02']
+    data = client.get(state['worksheet_submissions'][0]['pdf_url'], headers=auth).content
+    document = PdfReader(io.BytesIO(data))
+    assert len(document.pages) == 2
+    assert len(list(document.pages[0].images)) == 1
+    assert not list(document.pages[1].images)
+    import fitz
+    with fitz.open(stream=data, filetype='pdf') as rendered:
+        assert min(rendered[1].get_pixmap().samples) == 255, 'Missing pages must be completely white'
+    assert client.get('/api/participant/pdf', headers=auth).status_code == 404
+    assert upload(1).json()['detail']['code'] == 'worksheet_submitted'
+    export = client.post('/api/researcher/download', headers=csrf, json={'scope': 'submitted', 'types': ['pdf', 'csv']})
+    assert export.status_code == 200, export.text
+    with ZipFile(io.BytesIO(export.content)) as archive:
+        pid = state['participant_id']
+        assert f'{pid}/{pid}_01.pdf' in archive.namelist()
+        assert f'{pid}/{pid}_02.pdf' not in archive.namelist()
+        assert f'{pid}/{pid}.pdf' not in archive.namelist()
+        rows = list(csv.DictReader(io.StringIO(archive.read(f'{pid}/mapping.csv').decode('utf-8-sig'))))
+        assert [row['page_status'] for row in rows] == ['submitted', 'blank', 'not_registered']
+        assert rows[1]['original_filename'] == rows[1]['corrected_filename'] == ''
+        assert rows[1]['pdf_filename'] == f'{pid}_01.pdf'
+    listing = client.get('/api/researcher/participants').json()['participants'][0]
+    assert listing['submitted_worksheet_count'] == 1 and listing['blank_page_count'] == 1
+    assert upload(2).status_code == 200, 'A submitted file must not prevent registering another file'
+    assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 200
+    combined = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth).content))
+    assert len(combined.pages) == 3
+    assert [len(list(page.images)) for page in combined.pages] == [1, 0, 1]
+
+
+def test_zero_photo_individual_submission_is_protected_from_expiry(revision_harness, separate_pdfs):
+    from app.database import Participant, WorksheetSubmission
+    from sqlalchemy import select
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    assert client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth).status_code == 200
+    state = client.get('/api/participant', headers=auth).json()
+    assert state['pages'] == [] and state['status'] == 'partially_submitted'
+    assert state['blank_page_count'] == 2
+    app = revision_harness[1]
+    with app.state.db.read() as session:
+        participant = session.scalar(select(Participant))
+        assert participant.status == 'registered' and participant.submitted_at is not None
+        assert session.get(WorksheetSubmission, (participant.submission_id, ids[0])) is not None
+    assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 200
+    assert client.get('/api/participant', headers=auth).json()['status'] == 'submitted'
+    document = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth).content))
+    assert len(document.pages) == 3 and all(not list(page.images) for page in document.pages)
+
+
+def test_individual_submission_auth_ownership_and_retry(revision_harness, separate_pdfs):
+    from app.database import WorksheetSubmission
+    from sqlalchemy import select
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    url = f'/api/participant/worksheets/{ids[0]}/submit'
+    assert client.post(url).status_code == 401
+    assert client.post(f'/api/participant/worksheets/{uuid.uuid4()}/submit', headers=auth).status_code == 404
+    assert client.post(url, headers=auth).status_code == 200
+    result_url = f'/api/participant/worksheets/{ids[0]}/submission'
+    before = client.get(result_url, headers=auth).content
+    other = register(client)
+    assert client.get(result_url, headers=other).status_code == 404
+    assert client.get(result_url).status_code == 401
+    assert client.post(url, headers=auth).status_code == 200
+    assert client.get(result_url, headers=auth).content == before
+    with revision_harness[1].state.db.read() as session:
+        assert len(list(session.scalars(select(WorksheetSubmission)))) == 1
+
+
+def test_last_file_combined_storage_failure_rolls_back_only_new_submission(revision_harness, separate_pdfs, monkeypatch):
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    assert client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth).status_code == 200
+    before = client.get(f'/api/participant/worksheets/{ids[0]}/submission', headers=auth).content
+    storage = revision_harness[3]
+    put = storage.put
+    def fail_combined(key, data, content_type):
+        if key.endswith('/P001.pdf'):
+            raise OSError('Simulated combined-PDF failure after saving the individual PDF')
+        return put(key, data, content_type)
+    monkeypatch.setattr(storage, 'put', fail_combined)
+    assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 503
+    state = client.get('/api/participant', headers=auth).json()
+    assert [f['status'] for f in state['worksheet_submissions']] == ['submitted', 'registered']
+    assert client.get(f'/api/participant/worksheets/{ids[0]}/submission', headers=auth).content == before
+    monkeypatch.setattr(storage, 'put', put)
+    assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 200
+
+
+def test_concurrent_individual_submission_is_idempotent(revision_harness, separate_pdfs):
+    from concurrent.futures import ThreadPoolExecutor
+    from app.database import WorksheetSubmission
+    from sqlalchemy import select
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    url = f'/api/participant/worksheets/{ids[0]}/submit'
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        responses = list(pool.map(lambda _: client.post(url, headers=auth), range(3)))
+    assert all(response.status_code == 200 for response in responses)
+    with revision_harness[1].state.db.read() as session:
+        assert len(list(session.scalars(select(WorksheetSubmission)))) == 1
+
+
+def test_lost_individual_commit_acknowledgement_retains_pdf(revision_harness, separate_pdfs, monkeypatch):
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    session_class = revision_harness[1].state.db.sessions.class_
+    commit = session_class.commit
+    first = [True]
+    def commit_then_fail(session):
+        commit(session)
+        if first[0]:
+            first[0] = False
+            raise OSError('Lost acknowledgement after successful individual submission')
+    monkeypatch.setattr(session_class, 'commit', commit_then_fail)
+    url = f'/api/participant/worksheets/{ids[0]}/submit'
+    assert client.post(url, headers=auth).status_code == 503
+    result_url = f'/api/participant/worksheets/{ids[0]}/submission'
+    before = client.get(result_url, headers=auth).content
+    assert before.startswith(b'%PDF-')
+    assert client.post(url, headers=auth).status_code == 200
+    assert client.get(result_url, headers=auth).content == before
+
+
+def test_legacy_combined_submission_is_read_without_migrating_research_data(revision_harness, separate_pdfs, form_photos):
+    from app.database import WorksheetSubmission
+    from sqlalchemy import delete
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    for photo in form_photos:
+        response = client.post('/api/participant/pages', headers=auth, files={'file': ('form.jpg', photo, 'image/jpeg')})
+        assert response.status_code == 200, response.text
+    assert client.post('/api/participant/submit', headers=auth).status_code == 200
+    before = client.get('/api/participant/pdf', headers=auth).content
+    with revision_harness[1].state.db.write() as session:
+        session.execute(delete(WorksheetSubmission))
+    state = client.get('/api/participant', headers=auth).json()
+    assert all(file['status'] == 'submitted' for file in state['worksheet_submissions'])
+    for index, expected in enumerate([2, 1]):
+        response = client.get(f'/api/participant/worksheets/{ids[index]}/submission', headers=auth)
+        assert response.status_code == 200
+        assert len(PdfReader(io.BytesIO(response.content)).pages) == expected
+    assert client.get('/api/participant/pdf', headers=auth).content == before

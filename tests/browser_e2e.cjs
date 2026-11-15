@@ -48,7 +48,7 @@ fs.mkdirSync(output, { recursive: true });
     assert.equal(participantId, committedRegistration, 'Lost registration response must not create a second participant');
     const link = await page.locator('#resume-link').inputValue();
     assert.ok(link.includes('/#') && link.split('#')[1].length >= 32);
-    assert.equal(await page.locator('#submit-button').isDisabled(), true);
+    assert.equal(await page.locator('#submit-button').isDisabled(), false);
 
     async function upload(number, replace = false) {
       await page.locator('#gallery-input').setInputFiles(path.join(root, 'local-data', 'fixtures', `photo-${String(number).padStart(2, '0')}.jpg`));
@@ -64,7 +64,7 @@ fs.mkdirSync(output, { recursive: true });
     await upload(3);
     await page.locator('.page-row.complete').first().waitFor();
     assert.match(await page.locator('#latest-title').textContent(), /3/);
-    assert.equal(await page.locator('#submit-button').isDisabled(), true);
+    assert.equal(await page.locator('#submit-button').isDisabled(), false);
     await upload(1);
     assert.equal(await page.locator('.page-row.complete').count(), 2);
     await upload(1, true);

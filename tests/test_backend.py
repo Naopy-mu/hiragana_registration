@@ -149,7 +149,10 @@ def test_unreadable_qr_does_not_add_page(harness):
     assert response.status_code == 422
     assert response.json()["detail"]["code"] in {"qr_unreadable", "qr_not_found"}
     assert client.get("/api/participant", headers=auth(participant)).json()["pages"] == []
-    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 409
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    document = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth(participant)).content))
+    assert len(document.pages) == 3
+    assert all(not list(page.images) for page in document.pages)
 
 
 def test_unordered_photos_produce_ordered_pdf_and_selected_zip(harness, photos):
@@ -162,7 +165,7 @@ def test_unordered_photos_produce_ordered_pdf_and_selected_zip(harness, photos):
         assert response.status_code == 200, response.text
         assert response.json()["page"]["page_number"] == number
         if number != 2:
-            assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 409
+            assert client.get('/api/participant', headers=auth(participant)).json()['status'] == 'registered'
     state = client.get("/api/participant", headers=auth(participant)).json()
     assert [page["page_number"] for page in state["pages"]] == [1, 2, 3]
     assert not state["missing_pages"]

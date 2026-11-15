@@ -25,12 +25,13 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.database import CommitUncertain, Database, ExpiredRegistration, Page, Participant, StudyRevision, StudyState, now, utc_iso
+from app.database import CommitUncertain, Database, ExpiredRegistration, Page, Participant, StudyRevision, StudyState, WorksheetSubmission, now, utc_iso
 from app.revisions import RevisionConflict, RevisionMissing, RevisionNotProduction, StudyRegistry, WorksheetSelectionError
 from app.security import create_session, digest_token, read_session, registration_token, verify_password
 from app.settings import ROOT, Settings
 from app.storage import LocalStorage, SupabaseStorage
 from app.worksheet import worksheet_info
+from app.submissions import legacy_worksheet_pdf, submission_rows, worksheet_groups, worksheet_pdf_name, worksheet_states
 
 log = logging.getLogger('handwriting')
 
@@ -69,14 +70,20 @@ class Download(BaseModel):
     types: list[Literal['pdf', 'original', 'corrected', 'csv']] = Field(min_length=1, max_length=4)
 
 
-def make_pdf(participant, pages, storage):
+def make_pdf(participant, pages, storage, configured_pages=None):
     output = io.BytesIO()
     pdf = canvas.Canvas(output, pagesize=A4, pageCompression=1)
     pdf.setTitle(participant.participant_id)
-    for page in sorted(pages, key=lambda p: p.page_number):
-        pdf.bookmarkPage(page.qr_code)
-        pdf.addOutlineEntry(f'{page.page_number}: {page.qr_code}', page.qr_code, level=0)
-        pdf.drawImage(ImageReader(io.BytesIO(storage.get(page.corrected_path))), 0, 0, width=A4[0], height=A4[1])
+    present = {page.qr_code: page for page in pages}
+    configured_pages = configured_pages if configured_pages is not None else [
+        {'qr_code': page.qr_code, 'page_number': page.page_number} for page in pages]
+    for configured in sorted(configured_pages, key=lambda item: item['page_number']):
+        code = configured['qr_code']
+        pdf.bookmarkPage(code)
+        pdf.addOutlineEntry(f"{configured['page_number']}: {code}", code, level=0)
+        page = present.get(code)
+        if page is not None:
+            pdf.drawImage(ImageReader(io.BytesIO(storage.get(page.corrected_path))), 0, 0, width=A4[0], height=A4[1])
         pdf.showPage()
     pdf.save()
     return output.getvalue()
@@ -168,14 +175,22 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 'original_name': page.original_name, 'version': page.version,
                 'preview_url': f'/api/participant/pages/{page.qr_code}/preview'}
 
-    def participant_data(participant, pages):
+    def participant_data(participant, pages, session=None):
+        if session is None:
+            with db.read() as reader:
+                return participant_data(participant, pages, reader)
         study_manifest = registry.manifest_for(participant)
         present = {p.qr_code for p in pages}
+        states = worksheet_states(session, participant, pages, registry)
+        submitted_count = sum(item['status'] == 'submitted' for item in states)
         return {'participant_id': participant.participant_id, 'registered_at': utc_iso(participant.registered_at),
-                'status': participant.status, 'pages': [page_data(p, study_manifest) for p in pages],
+                'status': 'partially_submitted' if submitted_count and participant.status != 'submitted' else participant.status,
+                'pages': [page_data(p, study_manifest) for p in pages],
                 'missing_pages': [p['qr_code'] for p in study_manifest['pages'] if p['required'] and p['qr_code'] not in present],
                 'worksheet': worksheet_info(study_manifest), 'config': public_config(study_manifest),
                 'worksheets': registry.participant_files(participant),
+                'worksheet_submissions': states, 'submitted_worksheet_count': submitted_count,
+                'blank_page_count': sum(item['blank_pages'] for item in states),
                 'worksheet_revision_id': participant.worksheet_revision_id}
 
     def clean(keys):
@@ -274,6 +289,10 @@ def create_app(settings: Settings | None = None, storage_override=None):
                     registration_expired()
                 if current.status == 'submitted':
                     fail(409, 'already_submitted', '提出済みのため変更できません。')
+                configured = next(page for page in study_manifest['pages'] if page['qr_code'] == processed.qr_code)
+                file_id = configured.get('worksheet_id', current.worksheet_revision_id)
+                if s.get(WorksheetSubmission, (current.submission_id, file_id)):
+                    fail(409, 'worksheet_submitted', 'この用紙は提出済みのため変更できません。他の未提出の用紙は登録できます。')
                 existing = s.scalar(select(Page).where(Page.submission_id == current.submission_id, Page.qr_code == processed.qr_code))
                 if existing and not replace:
                     fail(409, 'duplicate_page', 'このページは登録済みです。新しい写真に差し替えますか？', qr_code=processed.qr_code, page_number=processed.page_number, version=existing.version)
@@ -300,7 +319,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 page.version = object_id
                 page.created_at = now()
                 s.flush()
-                result = {'page': page_data(page, study_manifest), 'participant': participant_data(current, get_pages(s, current))}
+                result = {'page': page_data(page, study_manifest), 'participant': participant_data(current, get_pages(s, current), s)}
         except CommitUncertain:
             log.warning('Page commit uncertain; retain storage objects and retry from participant view.')
             fail(503, 'commit_uncertain', '通信が中断されました。一覧を更新して登録状況を確認してください。')
@@ -322,33 +341,89 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 fail(404, 'page_missing', '画像が見つかりません。')
             return Response(storage.get(page.corrected_path), media_type='image/png')
 
-    @app.post('/api/participant/submit')
-    def submit(participant=Depends(participant_auth)):
-        new_key = None
+    def submit_files(participant, worksheet_id=None):
+        new_keys = []
         try:
-            with db.write() as s:
+            with pdf_slots, db.write() as s:
                 current = s.scalar(select(Participant).where(Participant.id == participant.id).with_for_update())
                 if current is None:
                     registration_expired()
+                groups = worksheet_groups(current, registry)
+                if worksheet_id is not None and worksheet_id not in {group['id'] for group in groups}:
+                    fail(404, 'worksheet_missing', 'この参加者の対象に含まれていない用紙です。')
                 pages = get_pages(s, current)
-                missing = participant_data(current, pages)['missing_pages']
-                if missing:
-                    fail(409, 'missing_pages', '未登録の必須ページがあります。', missing_pages=missing)
                 if current.status != 'submitted':
-                    pdf = make_pdf(current, pages, storage)
-                    new_key = f'{current.participant_id}/{current.submission_id}/{uuid.uuid4()}/{current.participant_id}.pdf'
-                    storage.put(new_key, pdf, 'application/pdf')
-                    current.pdf_path, current.status, current.submitted_at = new_key, 'submitted', now()
+                    present = {page.qr_code for page in pages}
+                    for group in groups:
+                        if worksheet_id is not None and group['id'] != worksheet_id:
+                            continue
+                        if s.get(WorksheetSubmission, (current.submission_id, group['id'])):
+                            continue
+                        data = make_pdf(current, pages, storage, group['pages'])
+                        name = worksheet_pdf_name(current, group, len(groups))
+                        key = f'{current.participant_id}/{current.submission_id}/{uuid.uuid4()}/{name}'
+                        new_keys.append(key)
+                        storage.put(key, data, 'application/pdf')
+                        s.add(WorksheetSubmission(submission_id=current.submission_id, worksheet_id=group['id'], pdf_path=key,
+                              blank_qrs_json=json.dumps([page['qr_code'] for page in group['pages'] if page['qr_code'] not in present])))
+                    s.flush()
+                    rows = submission_rows(s, current)
+                    if rows:
+                        # Also protects zero-photo, partially submitted IDs from expiry.
+                        current.submitted_at = current.submitted_at or now()
+                    if all(group['id'] in rows for group in groups):
+                        if len(groups) == 1:
+                            current.pdf_path = rows[groups[0]['id']].pdf_path
+                        else:
+                            combined = make_pdf(current, pages, storage, registry.manifest_for(current)['pages'])
+                            key = f'{current.participant_id}/{current.submission_id}/{uuid.uuid4()}/{current.participant_id}.pdf'
+                            new_keys.append(key)
+                            storage.put(key, combined, 'application/pdf')
+                            current.pdf_path = key
+                        current.status = 'submitted'
         except CommitUncertain:
             log.warning('Submission commit uncertain; retain PDF and retry submission safely.')
             fail(503, 'commit_uncertain', '提出状況を確認できませんでした。「提出する」で安全に再試行できます。')
         except HTTPException:
+            clean(new_keys)
             raise
         except Exception:
-            clean([new_key])
+            clean(new_keys)
             log.exception('PDF submission failed')
             fail(503, 'submission_failed', 'PDFを保存できませんでした。提出は完了していません。「提出する」で再試行できます。')
-        return {'participant_id': current.participant_id, 'status': 'submitted', 'pdf_url': '/api/participant/pdf'}
+        return {'participant_id': current.participant_id, 'status': current.status,
+                'pdf_url': '/api/participant/pdf' if current.status == 'submitted' else None}
+
+    @app.post('/api/participant/submit')
+    def submit(participant=Depends(participant_auth)):
+        return submit_files(participant)
+
+    @app.post('/api/participant/worksheets/{worksheet_id}/submit')
+    def submit_worksheet(worksheet_id: uuid.UUID, participant=Depends(participant_auth)):
+        result = submit_files(participant, str(worksheet_id))
+        return result | {'worksheet_id': str(worksheet_id), 'pdf_url': f'/api/participant/worksheets/{worksheet_id}/submission'}
+
+    @app.get('/api/participant/worksheets/{worksheet_id}/submission')
+    def participant_worksheet_submission(worksheet_id: uuid.UUID, participant=Depends(participant_auth)):
+        groups = worksheet_groups(participant, registry)
+        group = next((item for item in groups if item['id'] == str(worksheet_id)), None)
+        if group is None:
+            fail(404, 'worksheet_missing', 'この参加者の対象に含まれていない用紙です。')
+        with db.read() as s:
+            row = s.get(WorksheetSubmission, (participant.submission_id, str(worksheet_id)))
+            try:
+                if row:
+                    data = storage.get(row.pdf_path)
+                elif participant.status == 'submitted' and participant.pdf_path:
+                    data = storage.get(participant.pdf_path) if len(groups) == 1 else legacy_worksheet_pdf(participant, group, get_pages(s, participant), storage)
+                else:
+                    fail(404, 'pdf_missing', 'この用紙を提出した後にPDFを取得できます。')
+            except HTTPException:
+                raise
+            except Exception:
+                fail(503, 'storage_failed', '提出PDFを取得できませんでした。再度お試しください。')
+        name = worksheet_pdf_name(participant, group, len(groups))
+        return Response(data, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{name}"'})
 
     @app.get('/api/participant/pdf')
     def participant_pdf(participant=Depends(participant_auth)):
@@ -456,15 +531,22 @@ def create_app(settings: Settings | None = None, storage_override=None):
     def researcher_list(session=Depends(researcher_auth)):
         with db.read() as s:
             rows = s.execute(select(Participant, func.count(Page.id)).outerjoin(Page, Page.submission_id == Participant.submission_id).group_by(Participant.id).order_by(Participant.id)).all()
-            revisions = {r.id: json.loads(r.manifest_json) for r in s.scalars(select(StudyRevision))}
-            return {'participants': [{'participant_id': p.participant_id, 'registered_at': utc_iso(p.registered_at), 'status': p.status, 'page_count': count,
-                                     'total_pages': len(revisions[p.worksheet_revision_id]['pages']), 'worksheet_revision_id': p.worksheet_revision_id} for p, count in rows]}
+            participants = []
+            for p, count in rows:
+                data = participant_data(p, get_pages(s, p), s)
+                participants.append({'participant_id': p.participant_id, 'registered_at': utc_iso(p.registered_at),
+                    'status': data['status'], 'page_count': count, 'total_pages': len(data['config']['pages']),
+                    'worksheet_revision_id': p.worksheet_revision_id, 'worksheet_submissions': data['worksheet_submissions'],
+                    'submitted_worksheet_count': data['submitted_worksheet_count'], 'total_worksheets': len(data['worksheet_submissions']),
+                    'blank_page_count': data['blank_page_count']})
+            return {'participants': participants}
 
     @app.post('/api/researcher/download')
     def download(body: Download, session=Depends(researcher_auth)):
         with db.read() as s:
             if body.scope == 'submitted':
-                participants = list(s.scalars(select(Participant).where(Participant.status == 'submitted').order_by(Participant.id)))
+                participants = list(s.scalars(select(Participant).where(
+                    (Participant.status == 'submitted') | Participant.submission_id.in_(select(WorksheetSubmission.submission_id))).order_by(Participant.id)))
             else:
                 if not body.participant_ids:
                     fail(400, 'empty_selection', '対象者を選んでください。')
@@ -476,15 +558,19 @@ def create_app(settings: Settings | None = None, storage_override=None):
                     fail(400, 'invalid_selection', '対象者が見つかりません。')
             if not participants:
                 fail(400, 'empty_selection', '対象となる参加者がいません。')
-            if 'pdf' in body.types and any(p.status != 'submitted' for p in participants):
+            if 'pdf' in body.types and any(p.status != 'submitted' and not submission_rows(s, p) for p in participants):
                 fail(409, 'pdf_missing', '未提出の参加者にはPDFがありません。対象者か種類を変更してください。')
             output = tempfile.TemporaryFile()
             try:
                 with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
                     for p in participants:
                         pid = p.participant_id
-                        rows = []
-                        for page in get_pages(s, p):
+                        pages = get_pages(s, p)
+                        saved = {page.qr_code: page for page in pages}
+                        groups = worksheet_groups(p, registry)
+                        states = {item['id']: item for item in worksheet_states(s, p, pages, registry)}
+                        submitted = submission_rows(s, p)
+                        for page in pages:
                             stem = f'{page.page_number:03d}_{page.qr_code}'
                             original = f'original/{stem}{Path(page.original_path).suffix}'
                             corrected = f'corrected/{stem}.png'
@@ -492,14 +578,32 @@ def create_app(settings: Settings | None = None, storage_override=None):
                                 archive.writestr(f'{pid}/{original}', storage.get(page.original_path))
                             if 'corrected' in body.types:
                                 archive.writestr(f'{pid}/{corrected}', storage.get(page.corrected_path))
-                            rows.append([pid, page.qr_code, page.page_number, original, corrected, f'{pid}.pdf' if p.status == 'submitted' else ''])
                         if 'pdf' in body.types:
-                            archive.writestr(f'{pid}/{pid}.pdf', storage.get(p.pdf_path))
+                            if p.status == 'submitted':
+                                archive.writestr(f'{pid}/{pid}.pdf', storage.get(p.pdf_path))
+                            if len(groups) > 1:
+                                for group in groups:
+                                    if states[group['id']]['status'] != 'submitted':
+                                        continue
+                                    row = submitted.get(group['id'])
+                                    data = storage.get(row.pdf_path) if row else legacy_worksheet_pdf(p, group, pages, storage)
+                                    archive.writestr(f'{pid}/{worksheet_pdf_name(p, group, len(groups))}', data)
                         if 'csv' in body.types:
                             csv_output = io.StringIO(newline='')
                             writer = csv.writer(csv_output)
-                            writer.writerow(['participant_id', 'qr_code', 'page_number', 'original_filename', 'corrected_filename', 'pdf_filename'])
-                            writer.writerows(rows)
+                            writer.writerow(['participant_id', 'qr_code', 'page_number', 'original_filename', 'corrected_filename', 'pdf_filename',
+                                             'worksheet_number', 'worksheet_filename', 'file_page_number', 'page_status'])
+                            for group in groups:
+                                done = states[group['id']]['status'] == 'submitted'
+                                for configured in group['pages']:
+                                    page = saved.get(configured['qr_code'])
+                                    stem = f"{configured['page_number']:03d}_{configured['qr_code']}"
+                                    writer.writerow([pid, configured['qr_code'], configured['page_number'],
+                                        f'original/{stem}{Path(page.original_path).suffix}' if page else '',
+                                        f'corrected/{stem}.png' if page else '',
+                                        worksheet_pdf_name(p, group, len(groups)) if done else '',
+                                        group['number'], group['original_name'], configured.get('file_page_number', configured['page_number']),
+                                        'submitted' if page and done else 'registered' if page else 'blank' if done else 'not_registered'])
                             archive.writestr(f'{pid}/mapping.csv', csv_output.getvalue().encode('utf-8-sig'))
             except Exception:
                 output.close()
