@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from app.main import create_app
 from app.revisions import RevisionNotProduction, StudyRegistry
@@ -292,4 +292,169 @@ def test_production_registry_accepts_real_revision_and_cannot_reactivate_test(re
     assert production.summary()['active_revision_id'] == draft['draft_id']
     with pytest.raises(RevisionNotProduction):
         production.activate(old, draft['draft_id'])
+    with pytest.raises(RevisionNotProduction):
+        production.select_files([old], draft['draft_id'])
     assert active(client)['active_revision_id'] == draft['draft_id']
+
+
+@pytest.fixture(scope='session')
+def separate_pdfs(original_pdf):
+    source = PdfReader(io.BytesIO(original_pdf))
+    result = []
+    for page in source.pages[:3]:
+        writer, output = PdfWriter(), io.BytesIO()
+        writer.add_page(page)
+        writer.write(output)
+        result.append(output.getvalue())
+    return result
+
+
+def choose(client, csrf, ids, expected):
+    return client.post('/api/researcher/worksheet/selection', headers=csrf, json={
+        'worksheet_ids': ids, 'expected_active_revision_id': expected,
+    })
+
+
+def test_multiple_pdf_library_and_pinned_individual_downloads(revision_harness, separate_pdfs):
+    client, app, settings, storage = revision_harness
+    old_auth = register(client)
+    old = client.get('/api/participant', headers=old_auth).json()
+    csrf = login(client)
+    before = active(client)
+    drafts = [inspect(client, csrf, data, f'form-{i}.pdf') for i, data in enumerate(separate_pdfs, 1)]
+    assert active(client)['active_revision_id'] == before['active_revision_id']
+    assert len(active(client)['library']) == len(before['library']) + 3
+    ids = [drafts[1]['draft_id'], drafts[0]['draft_id']]
+    response = choose(client, csrf, ids, before['active_revision_id'])
+    assert response.status_code == 200, response.text
+    current = response.json()
+    assert current['selected_worksheet_ids'] == ids
+    auth = register(client)
+    new = client.get('/api/participant', headers=auth).json()
+    assert [f['number_label'] for f in new['worksheets']] == ['①', '②']
+    assert [f['id'] for f in new['worksheets']] == ids
+    assert new['worksheet']['download_url'] is None
+    assert client.get('/api/participant/worksheet', headers=auth).status_code == 400
+    assert new['missing_pages'] == ['HIRA1-02', 'HIRA1-01']
+    assert [p['page_number'] for p in new['config']['pages']] == [1, 2]
+    assert [p['label'] for p in new['config']['pages']] == ['① 1ページ', '② 1ページ']
+    for file, expected in zip(new['worksheets'], [separate_pdfs[1], separate_pdfs[0]]):
+        assert client.get(file['download_url']).status_code == 401
+        assert client.get(file['download_url'], headers=auth).content == expected
+        assert client.get(file['download_url'], headers=old_auth).status_code == 404
+    assert client.get('/api/participant/worksheets/' + drafts[2]['draft_id'], headers=auth).status_code == 404
+    assert client.get('/api/participant', headers=old_auth).json()['worksheet_revision_id'] == old['worksheet_revision_id']
+    # Selecting a single file afterwards must not affect this participant's pair.
+    assert choose(client, csrf, [drafts[2]['draft_id']], current['active_revision_id']).status_code == 200
+    assert len(client.get('/api/participant', headers=auth).json()['worksheets']) == 2
+    with TestClient(create_app(settings, storage_override=storage)) as restarted:
+        assert len(restarted.get('/api/participant', headers=auth).json()['worksheets']) == 2
+        latest_auth = register(restarted)
+        assert restarted.get('/api/participant', headers=latest_auth).json()['missing_pages'] == ['HIRA1-03']
+
+
+def test_selection_auth_csrf_empty_duplicate_and_missing(revision_harness, separate_pdfs):
+    client, _, _, _ = revision_harness
+    body = {'worksheet_ids': [str(uuid.uuid4())], 'expected_active_revision_id': str(uuid.uuid4())}
+    assert client.post('/api/researcher/worksheet/selection', json=body).status_code == 401
+    csrf = login(client)
+    assert client.post('/api/researcher/worksheet/selection', json=body).status_code == 403
+    before = active(client)['active_revision_id']
+    draft = inspect(client, csrf, separate_pdfs[0])['draft_id']
+    assert choose(client, csrf, [], before).status_code == 422
+    assert choose(client, csrf, [draft, draft], before).status_code == 422
+    assert choose(client, csrf, [str(uuid.uuid4())], before).status_code == 404
+    assert active(client)['active_revision_id'] == before
+
+
+def test_selection_duplicate_qr_and_storage_failure_keep_old_selection(revision_harness, separate_pdfs):
+    client, _, _, storage = revision_harness
+    csrf = login(client)
+    before = active(client)['active_revision_id']
+    a, b = [inspect(client, csrf, separate_pdfs[0])['draft_id'] for _ in range(2)]
+    conflict = choose(client, csrf, [a, b], before)
+    assert conflict.status_code == 422
+    assert conflict.json()['detail']['code'] == 'invalid_worksheet_selection'
+    assert active(client)['active_revision_id'] == before
+    storage.fail_next_get = True
+    assert choose(client, csrf, [a], before).status_code == 503
+    assert active(client)['active_revision_id'] == before
+
+
+def test_selection_conflicts_retries_and_preserves_library(revision_harness, separate_pdfs):
+    client, _, _, _ = revision_harness
+    csrf = login(client)
+    before = active(client)['active_revision_id']
+    ids = [inspect(client, csrf, data)['draft_id'] for data in separate_pdfs]
+    first = choose(client, csrf, ids[:2], before)
+    assert first.status_code == 200
+    assert choose(client, csrf, ids[:2], before).json()['active_revision_id'] == first.json()['active_revision_id']
+    assert choose(client, csrf, ids[1:], before).status_code == 409
+    latest = choose(client, csrf, ids[1:], first.json()['active_revision_id'])
+    assert latest.status_code == 200
+    assert {item['id'] for item in latest.json()['library']} >= set(ids)
+
+
+@pytest.mark.parametrize('commit_first', [False, True])
+def test_selection_uncertain_commit_recovers(revision_harness, separate_pdfs, monkeypatch, commit_first):
+    client, app, _, _ = revision_harness
+    csrf = login(client)
+    before = active(client)['active_revision_id']
+    draft = inspect(client, csrf, separate_pdfs[0])['draft_id']
+    session_class = app.state.db.sessions.class_
+    original_commit = session_class.commit
+    fail_once = [True]
+    def fail_commit(session):
+        if fail_once[0]:
+            fail_once[0] = False
+            if commit_first:
+                original_commit(session)
+            raise OSError('Simulated lost commit response')
+        return original_commit(session)
+    monkeypatch.setattr(session_class, 'commit', fail_commit)
+    assert choose(client, csrf, [draft], before).status_code == 503
+    assert (active(client)['active_revision_id'] != before) is commit_first
+    assert choose(client, csrf, [draft], before).status_code == 200
+
+
+@pytest.fixture(scope='session')
+def form_photos(separate_pdfs):
+    import fitz
+    from PIL import Image, ImageDraw
+    photos = []
+    for data in separate_pdfs[:2]:
+        with fitz.open(stream=data, filetype='pdf') as document:
+            pixmap = document[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+            page = Image.frombytes('RGB', (pixmap.width, pixmap.height), pixmap.samples)
+        pen = ImageDraw.Draw(page)
+        for y in range(250, 1350, 35):
+            for x in range(180, 1000, 60):
+                pen.line([(x, y), (x + 20, y + 20), (x + 40, y + 3)], fill=(75, 75, 75), width=3)
+        photo = Image.new('RGB', (page.width + 200, page.height + 200), 'white')
+        photo.paste(page, (100, 100))
+        output = io.BytesIO()
+        photo.save(output, format='JPEG', quality=95)
+        photos.append(output.getvalue())
+    return photos
+
+
+def test_selected_forms_require_all_pages_and_submit_in_file_order(revision_harness, separate_pdfs, form_photos):
+    client, _, _, _ = revision_harness
+    csrf = login(client)
+    before = active(client)['active_revision_id']
+    drafts = [inspect(client, csrf, data)['draft_id'] for data in separate_pdfs[:2]]
+    assert choose(client, csrf, drafts[::-1], before).status_code == 200
+    auth = register(client)
+    first = client.post('/api/participant/pages', headers=auth, files={'file': ('form-a.jpg', form_photos[0], 'image/jpeg')})
+    assert first.status_code == 200, first.text
+    assert first.json()['page']['page_number'] == 2
+    assert first.json()['participant']['missing_pages'] == ['HIRA1-02']
+    assert client.post('/api/participant/submit', headers=auth).status_code == 409
+    second = client.post('/api/participant/pages', headers=auth, files={'file': ('form-b.jpg', form_photos[1], 'image/jpeg')})
+    assert second.status_code == 200, second.text
+    assert second.json()['page']['page_number'] == 1
+    assert not second.json()['participant']['missing_pages']
+    assert client.post('/api/participant/submit', headers=auth).status_code == 200
+    document = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth).content))
+    assert len(document.pages) == 2
+    assert [entry.title for entry in document.outline] == ['1: HIRA1-02', '2: HIRA1-01']

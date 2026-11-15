@@ -30,6 +30,18 @@ def test_rectifies_perspective_and_preserves_gray(photos,manifest):
     assert result.metrics["geometry_calibrated"] is False
 
 
+def test_selected_pdf_uses_its_own_geometry(photos, manifest):
+    from copy import deepcopy
+    config = deepcopy(manifest)
+    code = config['pages'][1]['qr_code']
+    config['page_geometries'] = {code: deepcopy(config['geometry'])}
+    config['geometry']['marker_centers_mm'] = [[30, 30], [180, 30], [180, 267], [30, 267]]
+    config['geometry']['output_width'] = 1000
+    result = process_image(photos[1].read_bytes(), config)
+    assert result.qr_code == code
+    assert result.metrics['output_width'] == 1654
+
+
 @pytest.mark.parametrize("rotation",[cv2.ROTATE_90_CLOCKWISE,cv2.ROTATE_180,cv2.ROTATE_90_COUNTERCLOCKWISE])
 def test_rotated_photo_has_same_orientation(photos,manifest,rotation):
     image=cv2.imdecode(np.frombuffer(photos[1].read_bytes(),np.uint8),cv2.IMREAD_COLOR)

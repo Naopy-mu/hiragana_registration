@@ -168,7 +168,7 @@ def process_image(data: bytes, manifest: dict) -> ProcessedImage:
     scale = min(1.0, 2000/max(h,w))
     gray = cv2.resize(gray_full, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     qr = qr_full*scale
-    geometry = manifest["geometry"]
+    geometry = manifest.get("page_geometries", {}).get(code, manifest["geometry"])
     markers, mm_transform = _select_markers(gray, qr, geometry)
     paper_w, paper_h = map(float, geometry["paper_mm"])
     paper_corners = np.array([[0,0],[paper_w,0],[paper_w,paper_h],[0,paper_h]],np.float32)

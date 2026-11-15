@@ -56,5 +56,5 @@ def worksheet_info(manifest):
     if not config:
         return {'available': False}
     return {'available': True, 'title': config['title'], 'filename': config['filename'],
-            'download_url': '/api/participant/worksheet',
+            'download_url': '/api/participant/worksheet' if len(manifest.get('worksheets', [])) <= 1 else None,
             'is_test': manifest.get('profile') == 'test' or config['test_only']}

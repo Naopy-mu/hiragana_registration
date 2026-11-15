@@ -26,7 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.database import CommitUncertain, Database, ExpiredRegistration, Page, Participant, StudyRevision, StudyState, now, utc_iso
-from app.revisions import RevisionConflict, RevisionMissing, RevisionNotProduction, StudyRegistry
+from app.revisions import RevisionConflict, RevisionMissing, RevisionNotProduction, StudyRegistry, WorksheetSelectionError
 from app.security import create_session, digest_token, read_session, registration_token, verify_password
 from app.settings import ROOT, Settings
 from app.storage import LocalStorage, SupabaseStorage
@@ -55,6 +55,11 @@ class Login(BaseModel):
 
 class ActivateWorksheet(BaseModel):
     draft_id: uuid.UUID
+    expected_active_revision_id: uuid.UUID
+
+
+class SelectWorksheets(BaseModel):
+    worksheet_ids: list[uuid.UUID] = Field(min_length=1, max_length=64)
     expected_active_revision_id: uuid.UUID
 
 
@@ -170,6 +175,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 'status': participant.status, 'pages': [page_data(p, study_manifest) for p in pages],
                 'missing_pages': [p['qr_code'] for p in study_manifest['pages'] if p['required'] and p['qr_code'] not in present],
                 'worksheet': worksheet_info(study_manifest), 'config': public_config(study_manifest),
+                'worksheets': registry.participant_files(participant),
                 'worksheet_revision_id': participant.worksheet_revision_id}
 
     def clean(keys):
@@ -230,6 +236,8 @@ def create_app(settings: Settings | None = None, storage_override=None):
     @app.get('/api/participant/worksheet')
     def participant_worksheet(participant=Depends(participant_auth)):
         revision = registry.for_participant(participant)
+        if len(registry.files(revision)) > 1:
+            fail(400, 'worksheet_selection_required', '①・②のボタンから、対象のPDFを個別にダウンロードしてください。')
         try:
             data, filename = registry.pdf(revision.id)
         except RevisionMissing:
@@ -237,6 +245,12 @@ def create_app(settings: Settings | None = None, storage_override=None):
         except Exception:
             fail(503, 'worksheet_unavailable', '用紙を取得できませんでした。時間をおいて再度お試しください。')
         return Response(data, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+
+    @app.get('/api/participant/worksheets/{worksheet_id}')
+    def participant_selected_worksheet(worksheet_id: uuid.UUID, participant=Depends(participant_auth)):
+        if str(worksheet_id) not in {item['id'] for item in registry.participant_files(participant)}:
+            fail(404, 'worksheet_unavailable', 'この参加者の配布対象に含まれていないPDFです。')
+        return worksheet_pdf(str(worksheet_id))
 
     @app.post('/api/participant/pages')
     def upload(file: UploadFile = File(...), replace: bool = Form(False), expected_version: str | None = Form(None), participant=Depends(participant_auth)):
@@ -417,6 +431,25 @@ def create_app(settings: Settings | None = None, storage_override=None):
         except Exception:
             log.exception('Worksheet activation failed')
             fail(503, 'worksheet_activation_failed', '配布用紙を変更できませんでした。現在の用紙を再読み込みして再度お試しください。')
+        return registry.summary()
+
+    @app.post('/api/researcher/worksheet/selection')
+    def researcher_select_worksheets(body: SelectWorksheets, session=Depends(researcher_auth)):
+        try:
+            registry.select_files([str(item) for item in body.worksheet_ids], str(body.expected_active_revision_id))
+        except RevisionConflict:
+            fail(409, 'revision_conflict', '別の操作で配布するPDFが変更されました。現在の選択を確認してからやり直してください。')
+        except WorksheetSelectionError as exc:
+            fail(422, 'invalid_worksheet_selection', str(exc))
+        except RevisionMissing:
+            fail(404, 'worksheet_missing', '選択したPDFが見つかりません。一覧を更新してください。')
+        except RevisionNotProduction as exc:
+            fail(422, 'test_worksheet_not_allowed', str(exc))
+        except CommitUncertain:
+            fail(503, 'commit_uncertain', '更新結果を確認できませんでした。現在の配布対象を再読み込みして確認してください。')
+        except Exception:
+            log.exception('Worksheet selection failed')
+            fail(503, 'worksheet_selection_failed', '配布対象を保存できませんでした。現在の選択を確認して再度お試しください。')
         return registry.summary()
 
     @app.get('/api/researcher/participants')

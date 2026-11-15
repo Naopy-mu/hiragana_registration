@@ -1,7 +1,7 @@
 "use strict";
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { config: null, participant: null, token: null, busy: false, collecting: false, worksheetBusy: false, csrf: null, participants: [], selected: new Set(), previewObjectUrl: null, worksheetRevision: null, worksheetDraft: null, revisionBusy: false };
+  const state = { config: null, participant: null, token: null, busy: false, collecting: false, worksheetBusy: false, csrf: null, participants: [], selected: new Set(), previewObjectUrl: null, worksheetRevision: null, worksheetSelection: [], revisionBusy: false };
   const storage = {
     get(store, key) { try { return window[store].getItem(key); } catch { return null; } },
     set(store, key, value) { try { window[store].setItem(key, value); } catch { /* Private browsing can disable storage. */ } },
@@ -99,11 +99,10 @@
     $("participant-heading-title").textContent = submitted ? "ご協力ありがとうございます" : "用紙を撮影して登録";
     $("participant-lead").textContent = submitted ? "提出済みのデータを確認できます。" : "用紙をダウンロードし、印刷・記入してから撮影してください。用紙はどの順番からでも登録できます。";
     const worksheet = participant.worksheet;
-    $("download-worksheet").hidden = !worksheet?.available;
-    $("download-worksheet").disabled = state.worksheetBusy;
     $("worksheet-unavailable").hidden = Boolean(worksheet?.available);
     $("worksheet-test-note").hidden = !worksheet?.is_test;
     $("worksheet-file-title").textContent = worksheet?.title || "";
+    renderWorksheetDownloads(participant);
     $("upload-section").hidden = submitted;
     $("submitted-panel").hidden = !submitted;
     $("submit-button").hidden = submitted;
@@ -130,6 +129,39 @@
     setParticipantBusy(state.busy);
   }
   async function loadParticipant() { renderParticipant(await api("/api/participant", { participant: true })); }
+  function numbered(number) {
+    return number <= 20 ? String.fromCodePoint(0x2460 + number - 1) : number <= 35 ? String.fromCodePoint(0x3251 + number - 21) : number <= 50 ? String.fromCodePoint(0x32b1 + number - 36) : `(${number})`;
+  }
+  function renderWorksheetDownloads(participant) {
+    const files = participant.worksheet?.available ? participant.worksheets || [] : [];
+    const first = $("download-worksheet");
+    $("worksheet-downloads").replaceChildren(first);
+    first.hidden = !participant.worksheet?.available;
+    first.disabled = state.worksheetBusy;
+    first.textContent = files.length ? `${files[0].number_label} ${files[0].original_name || files[0].title}（${files[0].page_count}ページ） ↓` : "記入用紙をダウンロード（PDF）";
+    for (const file of files.slice(1)) {
+      const button = make("button", "button primary worksheet-download", `${file.number_label} ${file.original_name || file.title}（${file.page_count}ページ） ↓`);
+      button.type = "button"; button.disabled = state.worksheetBusy;
+      button.addEventListener("click", () => downloadWorksheet(file, button));
+      $("worksheet-downloads").append(button);
+    }
+    if (files.length > 1) $("worksheet-file-title").textContent = `${files.length}種類のPDFをすべてダウンロードし、各用紙を記入・撮影してください。`;
+  }
+  async function downloadWorksheet(worksheet, button) {
+    if (state.worksheetBusy || !worksheet) return;
+    state.worksheetBusy = true; const label = button.textContent;
+    for (const item of document.querySelectorAll(".worksheet-download")) item.disabled = true;
+    button.textContent = "用紙を準備しています…"; message("worksheet-message", "");
+    try {
+      const filename = /\.pdf$/i.test(worksheet.original_name || "") ? worksheet.original_name : /^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\.pdf$/.test(worksheet.filename || "") ? worksheet.filename : "worksheet.pdf";
+      await download(await api(worksheet.download_url || "/api/participant/worksheet", { participant: true, binary: true }), filename);
+      announce("記入用紙のダウンロードを開始しました。A4・片面・実際のサイズで印刷してください。");
+    } catch (error) { message("worksheet-message", error.message); }
+    finally {
+      state.worksheetBusy = false; button.textContent = label;
+      for (const item of document.querySelectorAll(".worksheet-download")) item.disabled = false;
+    }
+  }
   async function blobForPage(page) { return api(page.preview_url || `/api/participant/pages/${encodeURIComponent(page.qr_code)}/preview`, { participant: true, binary: true }); }
   async function openPagePreview(page) {
     try {
@@ -299,64 +331,100 @@
     $("worksheet-management").setAttribute("aria-busy", String(busy));
     $("revision-file").disabled = busy;
     $("inspect-worksheet").disabled = busy || !$("revision-file").files.length;
-    $("activate-worksheet").disabled = busy || !state.worksheetDraft;
-    $("preview-draft-worksheet").disabled = busy || !state.worksheetDraft;
     $("download-current-worksheet").disabled = busy || !state.worksheetRevision?.download_url;
+    $("download-current-worksheet").hidden = !state.worksheetRevision?.download_url;
+    $("save-worksheet-selection").disabled = busy || !state.worksheetSelection.length;
+    for (const control of document.querySelectorAll("#worksheet-library input, #worksheet-library button, #current-worksheets button")) control.disabled = busy;
   }
-  function renderWorksheetRevision(revision) {
+  function renderWorksheetRevision(revision, preserveSelection = false) {
+    const preserve = preserveSelection && state.worksheetRevision?.active_revision_id === revision.active_revision_id;
     state.worksheetRevision = revision;
-    $("current-worksheet-name").textContent = revision.original_name || revision.title || "配布用紙は準備中です";
-    $("current-worksheet-count").textContent = revision.page_count ? `${revision.page_count}ページ` : "";
+    if (!preserve) state.worksheetSelection = [...(revision.selected_worksheet_ids || [])];
+    $("current-worksheet-name").textContent = revision.worksheets?.length ? `${revision.worksheets.length}種類のPDFを配布中` : revision.original_name || revision.title || "配布用紙は準備中です";
+    $("current-worksheet-count").textContent = revision.page_count ? `提出対象：合計${revision.page_count}ページ` : "";
     $("current-worksheet-date").textContent = revision.activated_at ? `更新日時：${dateParts(revision.activated_at).filter(Boolean).join(" ")}` : "";
     $("current-worksheet-pages-details").hidden = !revision.pages?.length;
     qrList("current-worksheet-pages", revision.pages);
+    const current = $("current-worksheets"); current.replaceChildren();
+    for (const file of revision.worksheets || []) {
+      const row = make("li"); const button = make("button", "text-button", `${file.number_label} ${file.original_name || file.title}`);
+      button.type = "button"; button.addEventListener("click", () => downloadLibraryFile(file));
+      row.append(button); current.append(row);
+    }
+    renderWorksheetLibrary();
     revisionBusy(state.revisionBusy);
   }
-  async function loadWorksheetRevision() {
-    try { renderWorksheetRevision(await api("/api/researcher/worksheet")); }
+  function renderWorksheetLibrary() {
+    const library = $("worksheet-library"); library.replaceChildren();
+    for (const file of state.worksheetRevision?.library || []) {
+      const row = make("div", "worksheet-library-row");
+      const label = make("label", "check-row"); const check = make("input"); check.type = "checkbox"; check.value = file.id;
+      check.checked = state.worksheetSelection.includes(file.id); check.disabled = state.revisionBusy;
+      check.addEventListener("change", () => {
+        state.worksheetSelection = check.checked ? [...state.worksheetSelection, file.id] : state.worksheetSelection.filter(id => id !== file.id);
+        renderWorksheetSelection(); revisionBusy(state.revisionBusy);
+      });
+      const info = make("span", "worksheet-library-info", file.original_name || file.title);
+      info.append(make("small", "muted", `${file.page_count}ページ${file.is_test ? " · テスト用紙" : ""}`)); label.append(check, info);
+      const button = make("button", "button secondary compact", "PDF確認"); button.type = "button";
+      button.addEventListener("click", () => downloadLibraryFile(file)); row.append(label, button); library.append(row);
+    }
+    if (!library.children.length) library.append(make("p", "small muted", "PDFを登録すると、ここから配布対象を選べます。"));
+    renderWorksheetSelection();
+  }
+  function renderWorksheetSelection() {
+    const preview = $("worksheet-selection-preview"); preview.replaceChildren();
+    for (const [index, id] of state.worksheetSelection.entries()) {
+      const file = state.worksheetRevision.library.find(item => item.id === id);
+      if (file) preview.append(make("li", "", `${numbered(index + 1)} ${file.original_name || file.title}`));
+    }
+    $("worksheet-selection-summary").textContent = `${state.worksheetSelection.length}件を選択中。選んだ順に①・②…と表示します。`;
+  }
+  async function downloadLibraryFile(file) {
+    if (state.revisionBusy) return;
+    revisionBusy(true); message("revision-message", "");
+    try { await download(await api(file.download_url, { binary: true }), file.original_name || file.filename || "worksheet.pdf"); }
+    catch (error) { message("revision-message", error.message, true); }
+    finally { revisionBusy(false); }
+  }
+  async function loadWorksheetRevision(preserveSelection = false) {
+    try { renderWorksheetRevision(await api("/api/researcher/worksheet"), preserveSelection); }
     catch (error) { message("revision-message", error.message, true); }
   }
-  function clearWorksheetDraft() {
-    state.worksheetDraft = null;
-    $("worksheet-draft").hidden = true;
-    qrList("draft-worksheet-pages", []);
-    revisionBusy(state.revisionBusy);
-  }
   async function inspectWorksheet() {
-    const file = $("revision-file").files[0];
-    if (state.revisionBusy || !file) return;
-    message("revision-message", ""); clearWorksheetDraft();
+    const files = Array.from($("revision-file").files);
+    if (state.revisionBusy || !files.length) return;
+    message("revision-message", "");
     const maxMb = state.config.max_upload_mb || 25;
-    if (file.size > maxMb * 1024 * 1024) { message("revision-message", `PDFは${maxMb}MB以内にしてください。`, true); return; }
-    revisionBusy(true); $("inspect-worksheet").textContent = "全ページを確認しています…";
+    revisionBusy(true); let saved = 0; const errors = [];
     try {
-      const form = new FormData(); form.append("file", file);
-      const draft = await api("/api/researcher/worksheet/inspect", { method: "POST", body: form, csrf: true });
-      state.worksheetDraft = draft;
-      $("draft-worksheet-name").textContent = draft.original_name || file.name;
-      $("draft-worksheet-count").textContent = `${draft.page_count}ページのQRと用紙位置を確認しました。`;
-      qrList("draft-worksheet-pages", draft.pages);
-      $("worksheet-draft").hidden = false;
-      announce("PDFの確認が完了しました。ページ数とQRを確認してから差し替えてください。");
-    } catch (error) { message("revision-message", error.message, true); }
-    finally { revisionBusy(false); $("inspect-worksheet").textContent = "PDFを確認"; }
+      for (const [index, file] of files.entries()) {
+        $("inspect-worksheet").textContent = `${index + 1} / ${files.length}件目を確認しています…`;
+        try {
+          if (file.size > maxMb * 1024 * 1024) throw new Error(`PDFは${maxMb}MB以内にしてください。`);
+          const form = new FormData(); form.append("file", file);
+          await api("/api/researcher/worksheet/inspect", { method: "POST", body: form, csrf: true }); saved++;
+        } catch (error) { errors.push(`${file.name}：${error.message}`); if (error.status === 401 || error.status === 403) break; }
+      }
+      $("revision-file").value = ""; await loadWorksheetRevision(true);
+      const text = `${saved}件のPDFを登録しました。一覧から配布対象を選択してください。${errors.length ? " " + errors.join(" ") : ""}`;
+      message("revision-message", text, errors.length > 0); announce(text);
+    } finally { revisionBusy(false); $("inspect-worksheet").textContent = "PDFを登録"; }
   }
   async function activateWorksheet() {
-    const draft = state.worksheetDraft;
-    if (state.revisionBusy || !draft) return;
+    if (state.revisionBusy || !state.worksheetSelection.length || !state.worksheetRevision) return;
+    const worksheetIds = [...state.worksheetSelection], expectedId = state.worksheetRevision.active_revision_id;
     revisionBusy(true);
-    const yes = await confirmAction("配布する用紙を差し替えますか？", "新しく参加する方から、この用紙を配布します。登録済みの参加者は登録時の用紙を継続して使用し、登録画像と提出済みPDFも保持されます。", "この用紙に差し替える");
-    if (!yes || state.worksheetDraft !== draft) { revisionBusy(false); return; }
+    const yes = await confirmAction(`${worksheetIds.length}件のPDFを配布しますか？`, "選択したPDFすべてを、新しく参加する方の記入・提出対象にします。登録済みの方は、登録時の用紙を継続します。", "この選択で配布する");
+    if (!yes) { revisionBusy(false); return; }
     message("revision-message", "");
     try {
-      await api("/api/researcher/worksheet/activate", { method: "POST", csrf: true, body: { draft_id: draft.draft_id, expected_active_revision_id: draft.active_revision_id } });
-      clearWorksheetDraft(); $("revision-file").value = "";
-      await loadWorksheetRevision();
-      message("revision-message", "配布用紙を差し替えました。新しく参加する方から適用されます。");
-      announce("配布用紙を差し替えました。");
+      renderWorksheetRevision(await api("/api/researcher/worksheet/selection", { method: "POST", csrf: true, body: { worksheet_ids: worksheetIds, expected_active_revision_id: expectedId } }));
+      message("revision-message", "配布するPDFを保存しました。新しく参加する方から適用されます。");
+      announce("配布するPDFを保存しました。");
     } catch (error) {
       message("revision-message", error.message, true);
-      if (error.status === 409) { clearWorksheetDraft(); await loadWorksheetRevision(); }
+      if (error.status === 409) await loadWorksheetRevision();
     } finally { revisionBusy(false); }
   }
   async function researcherInit() {
@@ -397,9 +465,9 @@
   $("capture-next-register").addEventListener("click", () => { $("capture-next-dialog").close(); registerQueuedPhotos(); });
   $("capture-next-review").addEventListener("click", () => { $("capture-next-dialog").close(); $("photo-queue").scrollIntoView({ block: "start", behavior: "smooth" }); });
   $("submit-button").addEventListener("click", submit);
-  $("revision-file").addEventListener("change", () => { clearWorksheetDraft(); message("revision-message", ""); });
+  $("revision-file").addEventListener("change", () => { message("revision-message", ""); revisionBusy(state.revisionBusy); });
   $("inspect-worksheet").addEventListener("click", inspectWorksheet);
-  $("activate-worksheet").addEventListener("click", activateWorksheet);
+  $("save-worksheet-selection").addEventListener("click", activateWorksheet);
   $("download-current-worksheet").addEventListener("click", async () => {
     if (state.revisionBusy || !state.worksheetRevision?.download_url) return;
     revisionBusy(true); message("revision-message", "");
@@ -407,25 +475,9 @@
     catch (error) { message("revision-message", error.message, true); }
     finally { revisionBusy(false); }
   });
-  $("preview-draft-worksheet").addEventListener("click", async () => {
-    if (state.revisionBusy || !state.worksheetDraft?.preview_url) return;
-    revisionBusy(true); message("revision-message", "");
-    try { await download(await api(state.worksheetDraft.preview_url, { binary: true }), "worksheet-preview.pdf"); }
-    catch (error) { message("revision-message", error.message, true); }
-    finally { revisionBusy(false); }
-  });
-  $("download-worksheet").addEventListener("click", async () => {
-    const worksheet = state.participant?.worksheet;
-    if (state.worksheetBusy || !worksheet?.available) return;
-    state.worksheetBusy = true;
-    const button = $("download-worksheet");
-    button.disabled = true; button.textContent = "用紙を準備しています…"; message("worksheet-message", "");
-    try {
-      const filename = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\.pdf$/.test(worksheet.filename || "") ? worksheet.filename : "worksheet.pdf";
-      await download(await api(worksheet.download_url || "/api/participant/worksheet", { participant: true, binary: true }), filename);
-      announce("記入用紙のダウンロードを開始しました。A4・片面・実際のサイズで印刷してください。");
-    } catch (error) { message("worksheet-message", error.message); }
-    finally { state.worksheetBusy = false; button.disabled = false; button.textContent = "記入用紙をダウンロード（PDF）"; }
+  $("download-worksheet").addEventListener("click", () => {
+    const worksheet = state.participant?.worksheets?.[0] || (state.participant?.worksheet?.available ? state.participant.worksheet : null);
+    downloadWorksheet(worksheet, $("download-worksheet"));
   });
   $("close-preview").addEventListener("click", () => $("preview-dialog").close());
   $("confirm-cancel").addEventListener("click", () => $("confirm-dialog").close("cancel")); $("confirm-accept").addEventListener("click", () => $("confirm-dialog").close("accept"));
@@ -436,7 +488,7 @@
     catch (error) { message("login-error", error.message); }
     finally { $("login-button").disabled = false; }
   });
-  $("logout-button").addEventListener("click", async () => { try { await api("/api/researcher/logout", { method: "POST", csrf: true }); state.csrf = null; state.selected.clear(); clearWorksheetDraft(); state.worksheetRevision = null; $("revision-file").value = ""; message("revision-message", ""); $("researcher-content").hidden = true; $("login-panel").hidden = false; $("logout-button").hidden = true; } catch (error) { message("app-error", error.message); } });
+  $("logout-button").addEventListener("click", async () => { try { await api("/api/researcher/logout", { method: "POST", csrf: true }); state.csrf = null; state.selected.clear(); state.worksheetRevision = null; $("revision-file").value = ""; message("revision-message", ""); $("researcher-content").hidden = true; $("login-panel").hidden = false; $("logout-button").hidden = true; } catch (error) { message("app-error", error.message); } });
   $("refresh-participants").addEventListener("click", async () => { $("refresh-participants").disabled = true; try { await loadResearchers(); message("app-error", ""); } catch (error) { message("app-error", error.message); } finally { $("refresh-participants").disabled = false; } });
   $("select-all").addEventListener("change", event => { state.selected = event.target.checked ? new Set(state.participants.map(p => p.participant_id)) : new Set(); document.querySelector('input[name="export-scope"][value="selected"]').checked = true; renderResearchers(); });
   $("export-button").addEventListener("click", async () => {

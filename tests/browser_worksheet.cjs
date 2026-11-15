@@ -33,7 +33,7 @@ fs.mkdirSync(output, { recursive: true });
     assert.equal(await page.locator('#worksheet-test-note').isVisible(), true);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     let worksheetRequests = 0;
-    page.on('request', req => { if (new URL(req.url()).pathname === '/api/participant/worksheet') worksheetRequests++; });
+    page.on('request', req => { if (/^\/api\/participant\/worksheets?(\/|$)/.test(new URL(req.url()).pathname)) worksheetRequests++; });
     const downloadPromise = page.waitForEvent('download');
     await page.evaluate(() => { const button = document.getElementById('download-worksheet'); button.click(); button.click(); });
     const downloaded = await downloadPromise;
@@ -72,14 +72,14 @@ fs.mkdirSync(output, { recursive: true });
     await page.unroute('**/api/participant');
     await page.reload();
     await page.locator('#download-worksheet').waitFor({ state: 'visible' });
-    await page.route('**/api/participant/worksheet', route => route.fulfill({
+    await page.route('**/api/participant/worksheet**', route => route.fulfill({
       status: 401, contentType: 'application/json', body: JSON.stringify({ detail: { message: '専用の再開リンクから開いてください。' } })
     }));
     await page.locator('#download-worksheet').click();
     await page.locator('#worksheet-message').waitFor({ state: 'visible' });
     assert.equal(await page.locator('#worksheet-message').textContent(), '専用の再開リンクから開いてください。');
     assert.equal(await page.locator('#download-worksheet').isDisabled(), false);
-    await page.unroute('**/api/participant/worksheet');
+    await page.unroute('**/api/participant/worksheet**');
     assert.deepEqual(errors, []);
     const result = { ok: true, participant, unavailableBeforeConsent: true, unauthorizedApiRejected: true, worksheetPages: pdfInfo.pages,
       rapidClicksRequestedOnce: true, resumedDownload: true, notConfiguredState: true, downloadFailureExplanation: true, browserErrors: errors };
