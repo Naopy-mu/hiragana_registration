@@ -1,4 +1,4 @@
-/* Independent submissions with real local API/storage, including all-white PDFs. */
+/* Independent submissions with real local API/storage, including unfilled template pages. */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -32,7 +32,15 @@ execFileSync(python, ['-c', [
   page.setDefaultTimeout(60000); page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => { if (/Content Security|Refused|Uncaught/i.test(message.text())) errors.push(message.text()); });
   page.on('request', request => { if (/\/worksheets\/.+\/submit$/.test(request.url())) requests.push(request.url()); });
-  const checkPdf = filename => JSON.parse(execFileSync(python, ['-c', 'import json,sys; from pypdf import PdfReader; p=PdfReader(sys.argv[1]); print(json.dumps({"pages":len(p.pages),"images":[len(list(page.images)) for page in p.pages]}))', filename], { encoding: 'utf8' }));
+  const checkPdf = filename => JSON.parse(execFileSync(python, ['-c', [
+    'import json,sys; import fitz; from pypdf import PdfReader',
+    'result = fitz.open(sys.argv[1]); template = fitz.open(sys.argv[2]); reader = PdfReader(sys.argv[1])',
+    'matches = []',
+    'for index in (0, 1):',
+    '    actual, expected = result[index].get_pixmap(), template[index].get_pixmap()',
+    '    matches.append((actual.width, actual.height, actual.samples) == (expected.width, expected.height, expected.samples))',
+    'print(json.dumps({"pages":len(result),"templateMatches":matches,"lastPagePhoto":len(result) == 3 and len(list(reader.pages[2].images)) == 1 and reader.pages[2].images[0].image.width > 1000}))',
+  ].join('\n'), filename, path.join(root, 'resources/worksheets/hiragana_collection_a4.pdf')], { encoding: 'utf8' }));
   try {
     const login = await context.request.post(base + '/api/researcher/login', { data: { password: 'library-browser-test-password' } });
     assert.equal(login.status(), 200); const csrf = (await login.json()).csrf_token;
@@ -49,10 +57,10 @@ execFileSync(python, ['-c', [
     await page.goto(base); await page.locator('#consent-checkbox').check(); await page.locator('#register-button').click();
     await page.locator('#worksheet-submissions').waitFor({ state: 'visible' });
     const first = page.locator(`[data-worksheet-id="${ids[0]}"]`), second = page.locator(`[data-worksheet-id="${ids[1]}"]`);
-    assert.equal(await first.locator('.worksheet-submit').isEnabled(), true, 'Zero photographs may be submitted as blank pages');
+    assert.equal(await first.locator('.worksheet-submit').isEnabled(), true, 'Zero photographs may be submitted using unfilled templates');
     assert.equal(await page.locator('#submit-button').isVisible(), false, 'Multiple files have independent submit buttons');
     await first.locator('.worksheet-submit').click();
-    assert.match(await page.locator('#confirm-description').textContent(), /未登録の2ページは白紙/);
+    assert.match(await page.locator('#confirm-description').textContent(), /未登録の2ページを、参加登録時の同じ用紙の未記入テンプレートで補います/);
     await page.locator('#confirm-cancel').click(); assert.equal(requests.length, 0);
     await first.locator('.worksheet-submit').evaluate(button => { button.click(); button.click(); });
     await page.locator('#confirm-accept').click();
@@ -61,8 +69,8 @@ execFileSync(python, ['-c', [
     assert.equal(await second.locator('.worksheet-submit').isEnabled(), true);
     assert.equal(await page.locator('#camera-button').isEnabled(), true);
     const event = page.waitForEvent('download'); await first.locator('.worksheet-result-download').click();
-    const download = await event, destination = path.join(output, 'blank-a.pdf'); await download.saveAs(destination);
-    assert.deepEqual(checkPdf(destination), { pages: 2, images: [0, 0] });
+    const download = await event, destination = path.join(output, 'unfilled-a.pdf'); await download.saveAs(destination);
+    assert.deepEqual(checkPdf(destination), { pages: 2, templateMatches: [true, true], lastPagePhoto: false });
     await page.reload(); await page.locator(`[data-worksheet-id="${ids[0]}"][data-status="submitted"]`).waitFor();
     await page.evaluate(() => document.activeElement?.blur());
     await page.screenshot({ path: path.join(output, 'mobile-partial-submission.png'), fullPage: true, mask: [page.locator('#resume-link')] });
@@ -73,7 +81,7 @@ execFileSync(python, ['-c', [
     await page.setViewportSize({ width: 390, height: 844 });
     const researcher = await context.newPage(); await researcher.goto(base + '/researcher');
     await researcher.getByText('一部提出', { exact: true }).waitFor();
-    assert.match(await researcher.locator('#participant-rows').textContent(), /1 \/ 2用紙提出 · 白紙2ページ/);
+    assert.match(await researcher.locator('#participant-rows').textContent(), /1 \/ 2用紙提出 · 未記入2ページ/);
     await researcher.close();
     await page.locator('#gallery-input').setInputFiles(path.join(output, 'photo-b.jpg'));
     await page.locator('#capture-next-register').click();
@@ -84,11 +92,11 @@ execFileSync(python, ['-c', [
     await page.locator('#confirm-accept').click(); await page.locator('#submitted-panel').waitFor({ state: 'visible' });
     const combinedEvent = page.waitForEvent('download'); await page.locator('#download-pdf').click();
     const combined = await combinedEvent, combinedPath = path.join(output, 'combined.pdf'); await combined.saveAs(combinedPath);
-    assert.deepEqual(checkPdf(combinedPath), { pages: 3, images: [0, 0, 1] });
+    assert.deepEqual(checkPdf(combinedPath), { pages: 3, templateMatches: [true, true], lastPagePhoto: true });
     assert.equal(requests.length, 2); assert.deepEqual(errors, []);
-    const result = { ok: true, independentSubmitButtons: true, zeroPhotoSubmission: true, blankPageCounts: [2, 0],
+    const result = { ok: true, independentSubmitButtons: true, zeroPhotoSubmission: true, unfilledPageCounts: [2, 0],
       confirmationAndCancellation: true, duplicateClickRequestedOnce: true, otherFileRemainsEditable: true,
-      stateSurvivesReload: true, researcherShowsPartialSubmission: true, combinedPageImages: [0, 0, 1],
+      stateSurvivesReload: true, researcherShowsPartialSubmission: true, combinedTemplatesMatchOriginal: true, combinedLastPagePhoto: true,
       viewportWidths: [320, 390, 844, 1440], browserErrors: errors, localTestDataOnly: true };
     fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
   } finally { await context.close(); await browser.close(); }

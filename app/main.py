@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
@@ -70,22 +71,39 @@ class Download(BaseModel):
     types: list[Literal['pdf', 'original', 'corrected', 'csv']] = Field(min_length=1, max_length=4)
 
 
-def make_pdf(participant, pages, storage, configured_pages=None):
-    output = io.BytesIO()
-    pdf = canvas.Canvas(output, pagesize=A4, pageCompression=1)
-    pdf.setTitle(participant.participant_id)
+def make_pdf(participant, pages, storage, configured_pages, registry):
     present = {page.qr_code: page for page in pages}
-    configured_pages = configured_pages if configured_pages is not None else [
-        {'qr_code': page.qr_code, 'page_number': page.page_number} for page in pages]
-    for configured in sorted(configured_pages, key=lambda item: item['page_number']):
+    configured_pages = sorted(configured_pages, key=lambda item: item['page_number'])
+    photos = io.BytesIO()
+    pdf = canvas.Canvas(photos, pagesize=A4, pageCompression=1)
+    photo_positions = {}
+    for configured in configured_pages:
         code = configured['qr_code']
-        pdf.bookmarkPage(code)
-        pdf.addOutlineEntry(f"{configured['page_number']}: {code}", code, level=0)
         page = present.get(code)
         if page is not None:
+            photo_positions[code] = len(photo_positions)
             pdf.drawImage(ImageReader(io.BytesIO(storage.get(page.corrected_path))), 0, 0, width=A4[0], height=A4[1])
-        pdf.showPage()
+            pdf.showPage()
     pdf.save()
+    photo_pdf = PdfReader(photos) if photo_positions else None
+    templates = {}
+    writer = PdfWriter()
+    writer.add_metadata({'/Title': participant.participant_id})
+    for index, configured in enumerate(configured_pages):
+        code = configured['qr_code']
+        if code in photo_positions:
+            writer.add_page(photo_pdf.pages[photo_positions[code]])
+        else:
+            # Use the participant's immutable source, including file-local page order.
+            worksheet_id = configured.get('worksheet_id', participant.worksheet_revision_id)
+            if worksheet_id not in templates:
+                data, _ = registry.pdf(worksheet_id)
+                templates[worksheet_id] = PdfReader(io.BytesIO(data))
+            source_page = configured.get('file_page_number', configured['page_number']) - 1
+            writer.add_page(templates[worksheet_id].pages[source_page])
+        writer.add_outline_item(f"{configured['page_number']}: {code}", index)
+    output = io.BytesIO()
+    writer.write(output)
     return output.getvalue()
 
 
@@ -359,7 +377,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
                             continue
                         if s.get(WorksheetSubmission, (current.submission_id, group['id'])):
                             continue
-                        data = make_pdf(current, pages, storage, group['pages'])
+                        data = make_pdf(current, pages, storage, group['pages'], registry)
                         name = worksheet_pdf_name(current, group, len(groups))
                         key = f'{current.participant_id}/{current.submission_id}/{uuid.uuid4()}/{name}'
                         new_keys.append(key)
@@ -375,7 +393,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
                         if len(groups) == 1:
                             current.pdf_path = rows[groups[0]['id']].pdf_path
                         else:
-                            combined = make_pdf(current, pages, storage, registry.manifest_for(current)['pages'])
+                            combined = make_pdf(current, pages, storage, registry.manifest_for(current)['pages'], registry)
                             key = f'{current.participant_id}/{current.submission_id}/{uuid.uuid4()}/{current.participant_id}.pdf'
                             new_keys.append(key)
                             storage.put(key, combined, 'application/pdf')

@@ -3,6 +3,7 @@ import io
 import json
 import uuid
 
+import fitz
 import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfReader, PdfWriter
@@ -15,6 +16,13 @@ from app.storage import LocalStorage
 from scripts.generate_fixtures import generate
 
 PASSWORD = 'worksheet-revision-tests-2026'
+
+
+def assert_template_page(data, page_number, original, original_page_number=0):
+    with fitz.open(stream=data, filetype='pdf') as result, fitz.open(stream=original, filetype='pdf') as template:
+        actual = result[page_number].get_pixmap()
+        expected = template[original_page_number].get_pixmap()
+        assert (actual.width, actual.height, actual.samples) == (expected.width, expected.height, expected.samples)
 
 
 class FailingRevisionStorage(LocalStorage):
@@ -460,7 +468,7 @@ def test_selected_forms_combine_in_file_order(revision_harness, separate_pdfs, f
     assert [entry.title for entry in document.outline] == ['1: HIRA1-02', '2: HIRA1-01']
 
 
-def partial_setup(harness, separate_pdfs):
+def partial_setup(harness, separate_pdfs, *, reverse=False):
     client, _, _, _ = harness
     csrf = login(client)
     writer, output = PdfWriter(), io.BytesIO()
@@ -468,12 +476,14 @@ def partial_setup(harness, separate_pdfs):
         writer.add_page(PdfReader(io.BytesIO(source)).pages[0])
     writer.write(output)
     ids = [inspect(client, csrf, data)['draft_id'] for data in [output.getvalue(), separate_pdfs[2]]]
+    if reverse:
+        ids.reverse()
     assert choose(client, csrf, ids, active(client)['active_revision_id']).status_code == 200
     auth = register(client)
     return client, csrf, auth, ids
 
 
-def test_independent_partial_submission_blanks_and_other_file_remains_editable(revision_harness, separate_pdfs, form_photos):
+def test_independent_partial_submission_templates_and_other_file_remains_editable(revision_harness, separate_pdfs, form_photos):
     import csv
     from zipfile import ZipFile
     client, csrf, auth, ids = partial_setup(revision_harness, separate_pdfs)
@@ -489,10 +499,8 @@ def test_independent_partial_submission_blanks_and_other_file_remains_editable(r
     document = PdfReader(io.BytesIO(data))
     assert len(document.pages) == 2
     assert len(list(document.pages[0].images)) == 1
-    assert not list(document.pages[1].images)
-    import fitz
-    with fitz.open(stream=data, filetype='pdf') as rendered:
-        assert min(rendered[1].get_pixmap().samples) == 255, 'Missing pages must be completely white'
+    assert_template_page(data, 1, separate_pdfs[1])
+    assert document.pages[0].images[0].image.width > 1000, 'Registered photographs retain their corrected image'
     assert client.get('/api/participant/pdf', headers=auth).status_code == 404
     assert upload(1).json()['detail']['code'] == 'worksheet_submitted'
     export = client.post('/api/researcher/download', headers=csrf, json={'scope': 'submitted', 'types': ['pdf', 'csv']})
@@ -502,6 +510,7 @@ def test_independent_partial_submission_blanks_and_other_file_remains_editable(r
         assert f'{pid}/{pid}_01.pdf' in archive.namelist()
         assert f'{pid}/{pid}_02.pdf' not in archive.namelist()
         assert f'{pid}/{pid}.pdf' not in archive.namelist()
+        assert archive.read(f'{pid}/{pid}_01.pdf') == data
         rows = list(csv.DictReader(io.StringIO(archive.read(f'{pid}/mapping.csv').decode('utf-8-sig'))))
         assert [row['page_status'] for row in rows] == ['submitted', 'blank', 'not_registered']
         assert rows[1]['original_filename'] == rows[1]['corrected_filename'] == ''
@@ -510,9 +519,13 @@ def test_independent_partial_submission_blanks_and_other_file_remains_editable(r
     assert listing['submitted_worksheet_count'] == 1 and listing['blank_page_count'] == 1
     assert upload(2).status_code == 200, 'A submitted file must not prevent registering another file'
     assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 200
-    combined = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth).content))
+    combined_data = client.get('/api/participant/pdf', headers=auth).content
+    combined = PdfReader(io.BytesIO(combined_data))
     assert len(combined.pages) == 3
-    assert [len(list(page.images)) for page in combined.pages] == [1, 0, 1]
+    assert_template_page(combined_data, 1, separate_pdfs[1])
+    for index in (0, 2):
+        assert len(list(combined.pages[index].images)) == 1
+        assert combined.pages[index].images[0].image.width > 1000
 
 
 def test_zero_photo_individual_submission_is_protected_from_expiry(revision_harness, separate_pdfs):
@@ -530,8 +543,52 @@ def test_zero_photo_individual_submission_is_protected_from_expiry(revision_harn
         assert session.get(WorksheetSubmission, (participant.submission_id, ids[0])) is not None
     assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 200
     assert client.get('/api/participant', headers=auth).json()['status'] == 'submitted'
-    document = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth).content))
-    assert len(document.pages) == 3 and all(not list(page.images) for page in document.pages)
+    data = client.get('/api/participant/pdf', headers=auth).content
+    assert len(PdfReader(io.BytesIO(data)).pages) == 3
+    for index, original in enumerate(separate_pdfs):
+        assert_template_page(data, index, original)
+
+
+def test_template_pages_use_pinned_files_and_local_page_numbers_in_reversed_selection(revision_harness, separate_pdfs):
+    client, csrf, auth, ids = partial_setup(revision_harness, separate_pdfs, reverse=True)
+    # Subsequent distribution changes must not replace this participant's original selection.
+    assert choose(client, csrf, [ids[1]], active(client)['active_revision_id']).status_code == 200
+    response = client.post('/api/participant/submit', headers=auth)
+    assert response.status_code == 200, response.text
+    first = client.get(f'/api/participant/worksheets/{ids[0]}/submission', headers=auth).content
+    second = client.get(f'/api/participant/worksheets/{ids[1]}/submission', headers=auth).content
+    assert len(PdfReader(io.BytesIO(first)).pages) == 1
+    assert len(PdfReader(io.BytesIO(second)).pages) == 2
+    assert_template_page(first, 0, separate_pdfs[2])
+    assert_template_page(second, 0, separate_pdfs[0])
+    assert_template_page(second, 1, separate_pdfs[1])
+    combined = client.get('/api/participant/pdf', headers=auth).content
+    assert len(PdfReader(io.BytesIO(combined)).pages) == 3
+    for index, source_index in enumerate([2, 0, 1]):
+        assert_template_page(combined, index, separate_pdfs[source_index])
+    reader = PdfReader(io.BytesIO(combined))
+    assert [item.title for item in reader.outline] == ['1: HIRA1-03', '2: HIRA1-01', '3: HIRA1-02']
+    assert [reader.get_destination_page_number(item) for item in reader.outline] == [0, 1, 2]
+
+
+def test_template_download_failure_keeps_worksheet_unsubmitted_and_allows_retry(revision_harness, separate_pdfs):
+    from app.database import WorksheetSubmission
+    from sqlalchemy import select
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    revision_harness[3].fail_next_get = True
+    url = f'/api/participant/worksheets/{ids[0]}/submit'
+    response = client.post(url, headers=auth)
+    assert response.status_code == 503
+    assert response.json()['detail']['code'] == 'submission_failed'
+    state = client.get('/api/participant', headers=auth).json()
+    assert state['status'] == 'registered'
+    assert all(file['status'] == 'registered' for file in state['worksheet_submissions'])
+    with revision_harness[1].state.db.read() as session:
+        assert list(session.scalars(select(WorksheetSubmission))) == []
+    assert client.post(url, headers=auth).status_code == 200
+    data = client.get(f'/api/participant/worksheets/{ids[0]}/submission', headers=auth).content
+    assert_template_page(data, 0, separate_pdfs[0])
+    assert_template_page(data, 1, separate_pdfs[1])
 
 
 def test_individual_submission_auth_ownership_and_retry(revision_harness, separate_pdfs):

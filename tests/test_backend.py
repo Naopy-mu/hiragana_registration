@@ -149,10 +149,16 @@ def test_unreadable_qr_does_not_add_page(harness):
     assert response.status_code == 422
     assert response.json()["detail"]["code"] in {"qr_unreadable", "qr_not_found"}
     assert client.get("/api/participant", headers=auth(participant)).json()["pages"] == []
+    original = client.get('/api/participant/worksheet', headers=auth(participant)).content
     assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
-    document = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth(participant)).content))
+    data = client.get('/api/participant/pdf', headers=auth(participant)).content
+    document = PdfReader(io.BytesIO(data))
     assert len(document.pages) == 3
-    assert all(not list(page.images) for page in document.pages)
+    import fitz
+    with fitz.open(stream=data, filetype='pdf') as result, fitz.open(stream=original, filetype='pdf') as template:
+        for index in range(3):
+            actual, expected = result[index].get_pixmap(), template[index].get_pixmap()
+            assert (actual.width, actual.height, actual.samples) == (expected.width, expected.height, expected.samples)
 
 
 def test_unordered_photos_produce_ordered_pdf_and_selected_zip(harness, photos):

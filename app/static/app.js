@@ -86,7 +86,7 @@
     $("submit-button").disabled = locked || !state.participant || photoQueue.hasPending;
     for (const button of document.querySelectorAll(".worksheet-submit")) button.disabled = locked || photoQueue.hasPending;
     for (const button of document.querySelectorAll(".worksheet-result-download")) button.disabled = busy || state.collecting;
-    if (state.participant) $("submit-hint").textContent = submitted ? "提出済みです。" : photoQueue.hasPending ? "一覧の写真を先に登録するか、一覧から外してください。" : state.participant.worksheet_submissions?.length > 1 ? "PDFごとに提出できます。未登録のページは白紙になります。" : "未登録のページは白紙として提出できます。";
+    if (state.participant) $("submit-hint").textContent = submitted ? "提出済みです。" : photoQueue.hasPending ? "一覧の写真を先に登録するか、一覧から外してください。" : state.participant.worksheet_submissions?.length > 1 ? "PDFごとに提出できます。未登録ページは未記入テンプレートで補います。" : "未登録ページは未記入テンプレートで補って提出できます。";
   }
   function resumeUrl() { return `${location.origin}/#${state.token}`; }
   function renderParticipant(participant) {
@@ -113,17 +113,17 @@
     const percent = state.config.pages.length ? Math.round((participant.pages.length + blankCodes.size) / state.config.pages.length * 100) : 0;
     $("progress-fill").style.width = `${percent}%`;
     $("progress-fill").parentElement.setAttribute("aria-valuenow", String(percent));
-    $("progress-description").textContent = submitted ? `提出が完了しました。写真${participant.pages.length}ページ・白紙${blankCodes.size}ページです。` : `写真${participant.pages.length}ページを登録済み、${blankCodes.size}ページを白紙で提出済みです。未登録のページも白紙で提出できます。`;
+    $("progress-description").textContent = submitted ? `提出が完了しました。写真${participant.pages.length}ページ・未記入${blankCodes.size}ページです。` : `写真${participant.pages.length}ページを登録済み、${blankCodes.size}ページを未記入で提出済みです。未登録ページは未記入テンプレートで補えます。`;
     const list = $("page-list"); list.replaceChildren();
     for (const page of state.config.pages) {
       const saved = participant.pages.find(p => p.qr_code === page.qr_code);
       const row = make("li", "page-row" + (saved ? " complete" : ""));
-      row.append(make("span", "page-state", saved ? "✓" : blankCodes.has(page.qr_code) ? "白" : String(page.page_number)));
+      row.append(make("span", "page-state", saved ? "✓" : blankCodes.has(page.qr_code) ? "未" : String(page.page_number)));
       const info = make("div", "page-info");
-      info.append(make("strong", "", page.label || `ページ ${page.page_number}`), make("small", "", page.qr_code + (blankCodes.has(page.qr_code) ? " · 白紙で提出済み" : page.required === false ? " · 任意" : "")));
+      info.append(make("strong", "", page.label || `ページ ${page.page_number}`), make("small", "", page.qr_code + (blankCodes.has(page.qr_code) ? " · 未記入で提出済み" : page.required === false ? " · 任意" : "")));
       row.append(info);
       if (saved) { const button = make("button", "", "確認"); button.type = "button"; button.setAttribute("aria-label", `${page.label || "ページ " + page.page_number}の補正画像を確認`); button.addEventListener("click", () => openPagePreview(saved)); row.append(button); }
-      else row.append(make("span", "missing-label", blankCodes.has(page.qr_code) ? "白紙で提出済み" : "未登録"));
+      else row.append(make("span", "missing-label", blankCodes.has(page.qr_code) ? "未記入で提出済み" : "未登録"));
       list.append(row);
     }
     renderWorksheetSubmissions(participant);
@@ -146,7 +146,7 @@
       button.addEventListener("click", () => downloadWorksheet(file, button));
       $("worksheet-downloads").append(button);
     }
-    if (files.length > 1) $("worksheet-file-title").textContent = `${files.length}種類のPDFがあります。それぞれ個別に提出できます。未登録のページは白紙になります。`;
+    if (files.length > 1) $("worksheet-file-title").textContent = `${files.length}種類のPDFがあります。それぞれ個別に提出できます。未登録ページは同じ用紙の未記入テンプレートで補います。`;
   }
   function renderWorksheetSubmissions(participant) {
     const files = participant.worksheet_submissions || [];
@@ -156,7 +156,7 @@
       const row = make("div", "worksheet-submission-row"); row.dataset.worksheetId = file.id; row.dataset.status = file.status;
       const done = file.status === "submitted";
       row.append(make("h3", "", `${file.number_label} ${file.original_name || file.title}`));
-      row.append(make("p", "small muted", done ? `提出済み · 写真${file.registered_pages}ページ／白紙${file.blank_pages}ページ` : `全${file.page_count}ページ中、写真${file.registered_pages}ページを登録済み。未登録の${file.missing_page_count}ページは白紙で提出します。`));
+      row.append(make("p", "small muted", done ? `提出済み · 写真${file.registered_pages}ページ／未記入${file.blank_pages}ページ` : `全${file.page_count}ページ中、写真${file.registered_pages}ページを登録済み。未登録の${file.missing_page_count}ページは未記入テンプレートで補います。`));
       const button = make("button", `button ${done ? "secondary worksheet-result-download" : "primary worksheet-submit"}`, done ? `${file.number_label}の提出PDFを確認` : `${file.number_label}を提出する`);
       button.type = "button";
       button.addEventListener("click", done ? async () => {
@@ -315,7 +315,7 @@
     setParticipantBusy(true); $("submit-button").textContent = "PDFを作成しています…"; message("app-error", "");
     try {
       const missing = file ? file.missing_page_count : state.config.pages.length - state.participant.pages.length;
-      const yes = await confirmAction(file ? `${file.number_label}を提出しますか？` : "この用紙を提出しますか？", `未登録の${missing}ページは白紙としてPDFに入ります。提出後は、この用紙の写真を変更できません。${file ? "他の未提出の用紙は引き続き登録・提出できます。" : ""}`, "白紙を含めて提出する");
+      const yes = await confirmAction(file ? `${file.number_label}を提出しますか？` : "この用紙を提出しますか？", `未登録の${missing}ページを、参加登録時の同じ用紙の未記入テンプレートで補います。提出後は、この用紙の写真を変更できません。${file ? "他の未提出の用紙は引き続き登録・提出できます。" : ""}`, "未記入を含めて提出する");
       if (!yes) return;
       await api(file ? file.submit_url : "/api/participant/submit", { method: "POST", participant: true });
       await loadParticipant(); $("latest-preview").hidden = true;
@@ -337,7 +337,7 @@
       checkbox.addEventListener("change", () => { if (checkbox.checked) state.selected.add(participant.participant_id); else state.selected.delete(participant.participant_id); if (state.selected.size) document.querySelector('input[name="export-scope"][value="selected"]').checked = true; updateSelection(); }); checkCell.append(checkbox);
       const [date, time] = dateParts(participant.registered_at); const dateCell = make("td", "", date); dateCell.append(make("span", "date", time));
       const statusCell = make("td"); statusCell.append(make("span", "state-chip" + (participant.status === "submitted" ? " done" : ""), participant.status === "submitted" ? "提出済み" : participant.status === "partially_submitted" ? "一部提出" : "登録中"));
-      if (participant.total_worksheets) statusCell.append(make("span", "date", `${participant.submitted_worksheet_count} / ${participant.total_worksheets}用紙提出 · 白紙${participant.blank_page_count}ページ`));
+      if (participant.total_worksheets) statusCell.append(make("span", "date", `${participant.submitted_worksheet_count} / ${participant.total_worksheets}用紙提出 · 未記入${participant.blank_page_count}ページ`));
       row.append(checkCell, make("td", "participant-code", participant.participant_id), dateCell, statusCell, make("td", "", `${participant.page_count} / ${participant.total_pages ?? state.config.pages.length}`)); rows.append(row);
     }
     $("empty-roster").hidden = state.participants.length > 0; updateSelection();
