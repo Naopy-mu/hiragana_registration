@@ -446,6 +446,29 @@ def form_photos(separate_pdfs):
     return photos
 
 
+@pytest.fixture(scope='session')
+def retaken_form_photo(form_photos):
+    from PIL import Image, ImageDraw
+    with Image.open(io.BytesIO(form_photos[0])) as source:
+        photo = source.convert('RGB')
+    ImageDraw.Draw(photo).rectangle((600, 650, 800, 700), fill=(25, 25, 25))
+    output = io.BytesIO()
+    photo.save(output, format='JPEG', quality=95)
+    return output.getvalue()
+
+
+def assert_submitted_photo(client, auth, pdf, index, page):
+    from PIL import Image
+    response = client.get(page['preview_url'], headers=auth)
+    assert response.status_code == 200
+    images = list(PdfReader(io.BytesIO(pdf)).pages[index].images)
+    assert len(images) == 1
+    with Image.open(io.BytesIO(response.content)) as corrected:
+        actual, expected = images[0].image.convert('RGB'), corrected.convert('RGB')
+        assert actual.size == expected.size
+        assert actual.tobytes() == expected.tobytes()
+
+
 def test_selected_forms_combine_in_file_order(revision_harness, separate_pdfs, form_photos):
     client, _, _, _ = revision_harness
     csrf = login(client)
@@ -502,7 +525,6 @@ def test_independent_partial_submission_templates_and_other_file_remains_editabl
     assert_template_page(data, 1, separate_pdfs[1])
     assert document.pages[0].images[0].image.width > 1000, 'Registered photographs retain their corrected image'
     assert client.get('/api/participant/pdf', headers=auth).status_code == 404
-    assert upload(1).json()['detail']['code'] == 'worksheet_submitted'
     export = client.post('/api/researcher/download', headers=csrf, json={'scope': 'submitted', 'types': ['pdf', 'csv']})
     assert export.status_code == 200, export.text
     with ZipFile(io.BytesIO(export.content)) as archive:
@@ -517,15 +539,120 @@ def test_independent_partial_submission_templates_and_other_file_remains_editabl
         assert rows[1]['pdf_filename'] == f'{pid}_01.pdf'
     listing = client.get('/api/researcher/participants').json()['participants'][0]
     assert listing['submitted_worksheet_count'] == 1 and listing['blank_page_count'] == 1
+    # A photo can fill a previously submitted template page without resubmitting the file.
+    filled = upload(1)
+    assert filled.status_code == 200, filled.text
+    filled_state = filled.json()['participant']
+    assert filled_state['status'] == 'partially_submitted'
+    assert [file['status'] for file in filled_state['worksheet_submissions']] == ['submitted', 'registered']
+    assert filled_state['blank_page_count'] == 0
+    assert filled_state['worksheet_submissions'][0]['submitted_at'] == state['worksheet_submissions'][0]['submitted_at']
+    updated = client.get(state['worksheet_submissions'][0]['pdf_url'], headers=auth).content
+    assert_submitted_photo(client, auth, updated, 1, filled.json()['page'])
+    assert client.get('/api/participant/pdf', headers=auth).status_code == 404
+    export = client.post('/api/researcher/download', headers=csrf, json={'scope': 'submitted', 'types': ['pdf', 'csv']})
+    assert export.status_code == 200, export.text
+    with ZipFile(io.BytesIO(export.content)) as archive:
+        assert archive.read(f'{pid}/{pid}_01.pdf') == updated
+        rows = list(csv.DictReader(io.StringIO(archive.read(f'{pid}/mapping.csv').decode('utf-8-sig'))))
+        assert [row['page_status'] for row in rows] == ['submitted', 'submitted', 'not_registered']
+        assert rows[1]['original_filename'] and rows[1]['corrected_filename']
+    listing = client.get('/api/researcher/participants').json()['participants'][0]
+    assert listing['blank_page_count'] == 0
     assert upload(2).status_code == 200, 'A submitted file must not prevent registering another file'
     assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 200
     combined_data = client.get('/api/participant/pdf', headers=auth).content
     combined = PdfReader(io.BytesIO(combined_data))
     assert len(combined.pages) == 3
-    assert_template_page(combined_data, 1, separate_pdfs[1])
-    for index in (0, 2):
+    for index in range(3):
         assert len(list(combined.pages[index].images)) == 1
         assert combined.pages[index].images[0].image.width > 1000
+
+
+def test_submitted_retake_updates_target_and_combined_but_keeps_other_pdf(revision_harness, separate_pdfs, form_photos, retaken_form_photo):
+    from app.database import Participant, WorksheetSubmission
+    from sqlalchemy import select
+    client, csrf, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    initial = client.post('/api/participant/pages', headers=auth,
+                          files={'file': ('first.jpg', form_photos[0], 'image/jpeg')})
+    assert initial.status_code == 200, initial.text
+    initial_page = initial.json()['page']
+    assert client.post('/api/participant/submit', headers=auth).status_code == 200
+    state = client.get('/api/participant', headers=auth).json()
+    result_urls = [file['pdf_url'] for file in state['worksheet_submissions']]
+    other_pdf = client.get(result_urls[1], headers=auth).content
+    with revision_harness[1].state.db.read() as session:
+        participant = session.scalar(select(Participant))
+        submitted_at = participant.submitted_at
+        other_path = session.get(WorksheetSubmission, (participant.submission_id, ids[1])).pdf_path
+    duplicate = client.post('/api/participant/pages', headers=auth,
+                            files={'file': ('retaken.jpg', retaken_form_photo, 'image/jpeg')})
+    assert duplicate.status_code == 409 and duplicate.json()['detail']['code'] == 'duplicate_page'
+    replaced = client.post('/api/participant/pages', headers=auth,
+                           files={'file': ('retaken.jpg', retaken_form_photo, 'image/jpeg')},
+                           data={'replace': 'true', 'expected_version': initial_page['version']})
+    assert replaced.status_code == 200, replaced.text
+    page, updated = replaced.json()['page'], replaced.json()['participant']
+    assert updated['status'] == 'submitted' and updated['submitted_worksheet_count'] == 2
+    assert updated['blank_page_count'] == state['blank_page_count'] == 2
+    assert [file['submitted_at'] for file in updated['worksheet_submissions']] == [file['submitted_at'] for file in state['worksheet_submissions']]
+    target_pdf = client.get(result_urls[0], headers=auth).content
+    combined = client.get('/api/participant/pdf', headers=auth).content
+    assert_submitted_photo(client, auth, target_pdf, 0, page)
+    assert_submitted_photo(client, auth, combined, 0, page)
+    assert_template_page(target_pdf, 1, separate_pdfs[1])
+    assert_template_page(combined, 1, separate_pdfs[1])
+    assert_template_page(combined, 2, separate_pdfs[2])
+    assert client.get(result_urls[1], headers=auth).content == other_pdf
+    with revision_harness[1].state.db.read() as session:
+        participant = session.scalar(select(Participant))
+        assert participant.submitted_at == submitted_at
+        assert session.get(WorksheetSubmission, (participant.submission_id, ids[1])).pdf_path == other_path
+    export = client.post('/api/researcher/download', headers=csrf, json={'scope': 'submitted', 'types': ['pdf']})
+    assert export.status_code == 200, export.text
+    from zipfile import ZipFile
+    with ZipFile(io.BytesIO(export.content)) as archive:
+        pid = state['participant_id']
+        assert archive.read(f'{pid}/{pid}.pdf') == combined
+        assert archive.read(f'{pid}/{pid}_01.pdf') == target_pdf
+        assert archive.read(f'{pid}/{pid}_02.pdf') == other_pdf
+
+
+@pytest.mark.parametrize('failed_pdf', ['worksheet', 'combined'])
+def test_submitted_photo_pdf_failure_keeps_all_previous_data(revision_harness, separate_pdfs, form_photos, monkeypatch, failed_pdf):
+    from app.database import Page, Participant, WorksheetSubmission
+    from sqlalchemy import select
+    client, _, auth, _ = partial_setup(revision_harness, separate_pdfs)
+    assert client.post('/api/participant/submit', headers=auth).status_code == 200
+    before = client.get('/api/participant', headers=auth).json()
+    urls = [file['pdf_url'] for file in before['worksheet_submissions']] + ['/api/participant/pdf']
+    old_pdfs = [client.get(url, headers=auth).content for url in urls]
+    storage, app = revision_harness[3], revision_harness[1]
+    with app.state.db.read() as session:
+        old_paths = [session.scalar(select(Participant)).pdf_path]
+        old_paths.extend(row.pdf_path for row in session.scalars(select(WorksheetSubmission)))
+    put, attempted = storage.put, []
+    suffix = f"/{before['participant_id']}{'_01' if failed_pdf == 'worksheet' else ''}.pdf"
+    def fail_put(key, data, content_type):
+        attempted.append(key)
+        if key.endswith(suffix):
+            raise OSError('Simulated submitted-PDF update failure')
+        return put(key, data, content_type)
+    monkeypatch.setattr(storage, 'put', fail_put)
+    failed = client.post('/api/participant/pages', headers=auth,
+                         files={'file': ('added.jpg', form_photos[0], 'image/jpeg')})
+    assert failed.status_code == 503
+    assert client.get('/api/participant', headers=auth).json() == before
+    assert [client.get(url, headers=auth).content for url in urls] == old_pdfs
+    assert all(storage.path(path).is_file() for path in old_paths)
+    assert all(not storage.path(path).exists() for path in attempted)
+    with app.state.db.read() as session:
+        assert list(session.scalars(select(Page))) == []
+    monkeypatch.setattr(storage, 'put', put)
+    retry = client.post('/api/participant/pages', headers=auth,
+                        files={'file': ('added.jpg', form_photos[0], 'image/jpeg')})
+    assert retry.status_code == 200, retry.text
+    assert retry.json()['participant']['blank_page_count'] == before['blank_page_count'] - 1
 
 
 def test_zero_photo_individual_submission_is_protected_from_expiry(revision_harness, separate_pdfs):
@@ -662,17 +789,20 @@ def test_lost_individual_commit_acknowledgement_retains_pdf(revision_harness, se
     assert client.get(result_url, headers=auth).content == before
 
 
-def test_legacy_combined_submission_is_read_without_migrating_research_data(revision_harness, separate_pdfs, form_photos):
-    from app.database import WorksheetSubmission
-    from sqlalchemy import delete
+@pytest.mark.parametrize('missing_first', [False, True])
+def test_legacy_combined_submission_is_read_and_can_be_retaken(revision_harness, separate_pdfs, form_photos, retaken_form_photo, missing_first):
+    from app.database import Participant, WorksheetSubmission
+    from sqlalchemy import delete, select
     client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
-    for photo in form_photos:
+    for photo in form_photos[1:] if missing_first else form_photos:
         response = client.post('/api/participant/pages', headers=auth, files={'file': ('form.jpg', photo, 'image/jpeg')})
         assert response.status_code == 200, response.text
     assert client.post('/api/participant/submit', headers=auth).status_code == 200
     before = client.get('/api/participant/pdf', headers=auth).content
     with revision_harness[1].state.db.write() as session:
         session.execute(delete(WorksheetSubmission))
+        participant = session.scalar(select(Participant))
+        submitted_at = participant.submitted_at
     state = client.get('/api/participant', headers=auth).json()
     assert all(file['status'] == 'submitted' for file in state['worksheet_submissions'])
     for index, expected in enumerate([2, 1]):
@@ -680,3 +810,39 @@ def test_legacy_combined_submission_is_read_without_migrating_research_data(revi
         assert response.status_code == 200
         assert len(PdfReader(io.BytesIO(response.content)).pages) == expected
     assert client.get('/api/participant/pdf', headers=auth).content == before
+    target_number = 3 if missing_first else 1
+    old_page = next(page for page in state['pages'] if page['page_number'] == target_number)
+    retaken = retaken_form_photo
+    if missing_first:
+        from PIL import Image, ImageDraw
+        with Image.open(io.BytesIO(form_photos[2])) as source:
+            photo = source.convert('RGB')
+        ImageDraw.Draw(photo).rectangle((600, 650, 800, 700), fill=(25, 25, 25))
+        output = io.BytesIO()
+        photo.save(output, format='JPEG', quality=95)
+        retaken = output.getvalue()
+    replacement = client.post('/api/participant/pages', headers=auth,
+                              files={'file': ('retaken-legacy.jpg', retaken, 'image/jpeg')},
+                              data={'replace': 'true', 'expected_version': old_page['version']})
+    assert replacement.status_code == 200, replacement.text
+    updated = replacement.json()['participant']
+    assert updated['status'] == 'submitted' and updated['submitted_worksheet_count'] == 2
+    assert updated['blank_page_count'] == int(missing_first)
+    assert replacement.json()['page']['version'] != old_page['version']
+    assert [file['submitted_at'] for file in updated['worksheet_submissions']] == [file['submitted_at'] for file in state['worksheet_submissions']]
+    combined = client.get('/api/participant/pdf', headers=auth).content
+    first = client.get(f'/api/participant/worksheets/{ids[0]}/submission', headers=auth).content
+    second = client.get(f'/api/participant/worksheets/{ids[1]}/submission', headers=auth).content
+    for page in updated['pages']:
+        index = page['page_number'] - 1
+        assert_submitted_photo(client, auth, combined, index, page)
+        assert_submitted_photo(client, auth, first if index < 2 else second, index if index < 2 else 0, page)
+    if missing_first:
+        assert_template_page(combined, 0, separate_pdfs[0])
+        assert_template_page(first, 0, separate_pdfs[0])
+        assert updated['worksheet_submissions'][0]['blank_qr_codes'] == ['HIRA1-01']
+    with revision_harness[1].state.db.read() as session:
+        rows = list(session.scalars(select(WorksheetSubmission)))
+        assert len(rows) == 2 and {row.worksheet_id for row in rows} == set(ids)
+        assert all(row.submitted_at == submitted_at for row in rows)
+        assert session.scalar(select(Participant)).submitted_at == submitted_at

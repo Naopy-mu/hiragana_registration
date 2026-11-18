@@ -42,6 +42,27 @@ def photos(tmp_path_factory):
     return {index + 1: path.read_bytes() for index, path in enumerate(generate(tmp_path_factory.mktemp("study-photos")))}
 
 
+@pytest.fixture(scope="session")
+def replacement_photo(photos):
+    from PIL import Image, ImageDraw
+    with Image.open(io.BytesIO(photos[1])) as source:
+        image = source.convert("RGB")
+    ImageDraw.Draw(image).rectangle((800, 850, 1000, 900), fill=(25, 25, 25))
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=95)
+    return output.getvalue()
+
+
+def assert_pdf_photo_matches_preview(data, index, preview):
+    from PIL import Image
+    embedded = list(PdfReader(io.BytesIO(data)).pages[index].images)
+    assert len(embedded) == 1
+    with Image.open(io.BytesIO(preview)) as corrected:
+        actual, expected = embedded[0].image.convert("RGB"), corrected.convert("RGB")
+        assert actual.size == expected.size
+        assert actual.tobytes() == expected.tobytes()
+
+
 @pytest.fixture
 def harness(tmp_path, password_hash):
     settings = Settings(data_dir=tmp_path, session_secret="integration-session-secret-" + "x" * 40,
@@ -201,7 +222,8 @@ def test_unordered_photos_produce_ordered_pdf_and_selected_zip(harness, photos):
             assert embedded[0].image.convert("RGB").size == corrected.size
             assert embedded[0].image.convert("RGB").tobytes() == corrected.convert("RGB").tobytes()
     assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
-    assert upload(client, participant, photos[1]).status_code == 409
+    duplicate = upload(client, participant, photos[1])
+    assert duplicate.status_code == 409 and duplicate.json()["detail"]["code"] == "duplicate_page"
     csrf = login(client)
     listing = client.get("/api/researcher/participants").json()["participants"]
     assert [(row["status"], row["page_count"]) for row in listing] == [("submitted", 3), ("registered", 0)]
@@ -231,7 +253,8 @@ def test_unordered_photos_produce_ordered_pdf_and_selected_zip(harness, photos):
     }).status_code == 409
 
 
-def test_duplicate_replacement_preserves_old_data_until_new_save_succeeds(harness, photos):
+@pytest.mark.parametrize("submitted", [False, True])
+def test_duplicate_replacement_preserves_old_data_until_new_save_succeeds(harness, photos, replacement_photo, submitted):
     client, app, storage = harness
     participant = register(client)
     first = upload(client, participant, photos[1])
@@ -241,6 +264,10 @@ def test_duplicate_replacement_preserves_old_data_until_new_save_succeeds(harnes
     with app.state.db.read() as session:
         before = session.scalar(select(Page))
         old_paths = (before.original_path, before.corrected_path)
+    if submitted:
+        assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+        old_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+        old_state = client.get("/api/participant", headers=auth(participant)).json()
     duplicate = upload(client, participant, photos[1])
     assert duplicate.status_code == 409 and duplicate.json()["detail"]["code"] == "duplicate_page"
     bad = upload(client, participant, b"not a photograph", replace="true", expected_version=old_page["version"])
@@ -252,13 +279,112 @@ def test_duplicate_replacement_preserves_old_data_until_new_save_succeeds(harnes
     assert state["pages"][0]["version"] == old_page["version"]
     assert client.get(old_page["preview_url"], headers=auth(participant)).content == old_preview
     assert all(storage.path(path).is_file() for path in old_paths)
-    successful = upload(client, participant, photos[1], replace="true", expected_version=old_page["version"])
+    if submitted:
+        assert client.get("/api/participant/pdf", headers=auth(participant)).content == old_pdf
+        storage.fail_content_type = "application/pdf"
+        failed_pdf = upload(client, participant, replacement_photo, replace="true", expected_version=old_page["version"])
+        assert failed_pdf.status_code == 503
+        assert client.get("/api/participant", headers=auth(participant)).json() == old_state
+        assert client.get("/api/participant/pdf", headers=auth(participant)).content == old_pdf
+        assert client.get(old_page["preview_url"], headers=auth(participant)).content == old_preview
+    successful = upload(client, participant, replacement_photo, replace="true", expected_version=old_page["version"])
     assert successful.status_code == 200, successful.text
     assert successful.json()["page"]["version"] != old_page["version"]
     assert len(successful.json()["participant"]["pages"]) == 1
     assert all(not storage.path(path).exists() for path in old_paths)
+    if submitted:
+        state = successful.json()["participant"]
+        assert state["status"] == "submitted" and state["blank_page_count"] == 2
+        assert state["worksheet_submissions"][0]["submitted_at"] == old_state["worksheet_submissions"][0]["submitted_at"]
+        updated_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+        preview = client.get(old_page["preview_url"], headers=auth(participant)).content
+        assert preview != old_preview
+        assert_pdf_photo_matches_preview(updated_pdf, 0, preview)
+        assert client.get(state["worksheet_submissions"][0]["pdf_url"], headers=auth(participant)).content == updated_pdf
+        csrf = login(client)
+        pid = participant["participant_id"]
+        with zipped(client, csrf, types=["pdf", "original", "corrected"], scope="submitted") as archive:
+            assert archive.read(f"{pid}/{pid}.pdf") == updated_pdf
+            assert archive.read(f"{pid}/original/001_HIRA1-01.jpg") == replacement_photo
+            assert archive.read(f"{pid}/corrected/001_HIRA1-01.png") == preview
     stale = upload(client, participant, photos[1], replace="true", expected_version=old_page["version"])
     assert stale.status_code == 409 and stale.json()["detail"]["code"] == "version_conflict"
+
+
+def test_concurrent_submitted_replacement_accepts_only_one_expected_version(harness, photos, replacement_photo):
+    client, app, _ = harness
+    participant = register(client)
+    initial = upload(client, participant, photos[1]).json()["page"]
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: upload(client, participant, replacement_photo,
+                                                   replace="true", expected_version=initial["version"]), range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    rejected = next(response for response in responses if response.status_code == 409)
+    assert rejected.json()["detail"]["code"] == "version_conflict"
+    state = client.get("/api/participant", headers=auth(participant)).json()
+    assert state["status"] == "submitted" and len(state["pages"]) == 1
+    with app.state.db.read() as session:
+        assert session.scalar(select(func.count()).select_from(Page)) == 1
+    data = client.get("/api/participant/pdf", headers=auth(participant)).content
+    preview = client.get(state["pages"][0]["preview_url"], headers=auth(participant)).content
+    assert_pdf_photo_matches_preview(data, 0, preview)
+
+
+def test_pdf_download_recovers_when_replacement_removes_authenticated_pdf(harness, photos, replacement_photo, monkeypatch):
+    client, app, storage = harness
+    participant = register(client)
+    first = upload(client, participant, photos[1])
+    assert first.status_code == 200, first.text
+    old_page = first.json()["page"]
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    with app.state.db.read() as session:
+        old_pdf_key = session.scalar(select(Participant.pdf_path))
+    original_get = storage.get
+    reads = []
+    replaced = False
+
+    def replace_before_reading_old_pdf(key):
+        nonlocal replaced
+        reads.append(key)
+        if key == old_pdf_key and not replaced:
+            replaced = True
+            response = upload(client, participant, replacement_photo,
+                              replace="true", expected_version=old_page["version"])
+            assert response.status_code == 200, response.text
+            assert not storage.path(old_pdf_key).exists()
+        return original_get(key)
+
+    monkeypatch.setattr(storage, "get", replace_before_reading_old_pdf)
+    response = client.get("/api/participant/pdf", headers=auth(participant))
+    assert response.status_code == 200, response.text
+    assert replaced
+    with app.state.db.read() as session:
+        latest_pdf_key = session.scalar(select(Participant.pdf_path))
+    assert latest_pdf_key != old_pdf_key
+    assert reads.count(old_pdf_key) == 1 and reads.count(latest_pdf_key) == 1
+    assert response.content == original_get(latest_pdf_key)
+    preview = client.get(old_page["preview_url"], headers=auth(participant))
+    assert preview.status_code == 200, preview.text
+    assert_pdf_photo_matches_preview(response.content, 0, preview.content)
+
+
+def test_pdf_download_storage_failure_returns_retryable_error(harness, monkeypatch):
+    client, app, storage = harness
+    participant = register(client)
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    with app.state.db.read() as session:
+        pdf_key = session.scalar(select(Participant.pdf_path))
+
+    def unavailable_storage(key):
+        raise OSError("Simulated storage read failure")
+
+    monkeypatch.setattr(storage, "get", unavailable_storage)
+    response = client.get("/api/participant/pdf", headers=auth(participant))
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "storage_failed"
+    assert storage.path(pdf_key).is_file()
+    assert client.get("/api/participant", headers=auth(participant)).json()["status"] == "submitted"
 
 
 def test_pdf_storage_failure_keeps_unsubmitted_and_allows_retry(harness, photos):
@@ -280,7 +406,7 @@ def test_pdf_storage_failure_keeps_unsubmitted_and_allows_retry(harness, photos)
     assert client.get("/api/participant/pdf", headers=auth(participant)).status_code == 200
 
 
-def test_lost_commit_acknowledgement_preserves_committed_page_and_pdf(harness, photos, monkeypatch):
+def test_lost_commit_acknowledgement_preserves_committed_page_and_pdf(harness, photos, replacement_photo, monkeypatch):
     client, app, storage = harness
     participant = register(client)
     session_class = app.state.db.sessions.class_
@@ -321,6 +447,25 @@ def test_lost_commit_acknowledgement_preserves_committed_page_and_pdf(harness, p
     assert client.get("/api/participant/pdf", headers=auth(participant)).content == committed_pdf
     with app.state.db.read() as session:
         assert session.scalar(select(Participant)).pdf_path == committed_pdf_path
+        old_page = session.scalar(select(Page).where(Page.page_number == 1))
+        old_paths = [old_page.original_path, old_page.corrected_path, committed_pdf_path]
+        old_version = old_page.version
+    lose_acknowledgement["next"] = True
+    uncertain_replacement = upload(client, participant, replacement_photo, replace="true", expected_version=old_version)
+    assert uncertain_replacement.status_code == 503
+    assert uncertain_replacement.json()["detail"]["code"] == "commit_uncertain"
+    state = client.get("/api/participant", headers=auth(participant)).json()
+    assert state["status"] == "submitted" and state["pages"][0]["version"] != old_version
+    assert all(storage.path(path).is_file() for path in old_paths)
+    updated_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+    updated_preview = client.get(state["pages"][0]["preview_url"], headers=auth(participant)).content
+    assert_pdf_photo_matches_preview(updated_pdf, 0, updated_preview)
+    with app.state.db.read() as session:
+        row = session.scalar(select(Participant))
+        assert row.pdf_path != committed_pdf_path
+        assert storage.get(row.pdf_path) == updated_pdf
+    stale = upload(client, participant, replacement_photo, replace="true", expected_version=old_version)
+    assert stale.status_code == 409 and stale.json()["detail"]["code"] == "version_conflict"
 
 
 def test_researcher_session_secret_rotation_keeps_registration_retry_stable(tmp_path, password_hash):

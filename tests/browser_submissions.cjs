@@ -23,6 +23,7 @@ execFileSync(python, ['-c', [
   'for y in range(250,1350,35):',
   '    for x in range(180,1000,60): pen.line([(x,y),(x+20,y+20),(x+40,y+3)],fill=(75,75,75),width=3)',
   'photo = Image.new("RGB", (page.width+200,page.height+200), "white"); photo.paste(page,(100,100)); photo.save(folder/"photo-b.jpg",quality=95)',
+  'ImageDraw.Draw(photo).line([(350,350),(900,600)],fill=(30,30,30),width=12); photo.save(folder/"photo-b-retake.jpg",quality=95)',
 ].join('\n'), root, output]);
 
 (async () => {
@@ -93,10 +94,43 @@ execFileSync(python, ['-c', [
     const combinedEvent = page.waitForEvent('download'); await page.locator('#download-pdf').click();
     const combined = await combinedEvent, combinedPath = path.join(output, 'combined.pdf'); await combined.saveAs(combinedPath);
     assert.deepEqual(checkPdf(combinedPath), { pages: 3, templateMatches: [true, true], lastPagePhoto: true });
+    const token = await page.evaluate(() => sessionStorage.getItem('handwriting_resume_token'));
+    const getParticipant = async () => {
+      const response = await context.request.get(base + '/api/participant', { headers: { Authorization: `Bearer ${token}` } });
+      assert.equal(response.status(), 200); return response.json();
+    };
+    const beforeRetake = await getParticipant();
+    assert.equal(await page.locator('#camera-button').isEnabled(), true);
+    assert.equal(await page.locator('#gallery-button').isEnabled(), true);
+    await page.locator('#gallery-input').setInputFiles(path.join(output, 'photo-b-retake.jpg'));
+    await page.locator('#capture-next-register').click();
+    await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+    assert.match(await page.locator('#confirm-description').textContent(), /HIRA1-03/);
+    await page.locator('#confirm-accept').click();
+    await page.waitForFunction(() => document.getElementById('batch-progress').hidden && document.getElementById('batch-status').textContent.includes('1枚を登録しました'));
+    assert.equal(await page.locator('#latest-preview').isVisible(), true);
+    await page.reload(); await page.locator('#submitted-panel').waitFor({ state: 'visible' });
+    const afterRetake = await getParticipant();
+    assert.equal(afterRetake.status, 'submitted');
+    assert.notEqual(afterRetake.pages[0].version, beforeRetake.pages[0].version);
+    assert.deepEqual(afterRetake.worksheet_submissions.map(file => [file.id, file.status, file.submitted_at, file.blank_pages]),
+      beforeRetake.worksheet_submissions.map(file => [file.id, file.status, file.submitted_at, file.blank_pages]));
+    const refreshedEvent = page.waitForEvent('download'); await page.locator('#download-pdf').click();
+    const refreshedPath = path.join(output, 'combined-after-retake.pdf'); await (await refreshedEvent).saveAs(refreshedPath);
+    const individualEvent = page.waitForEvent('download'); await second.locator('.worksheet-result-download').click();
+    const individualPath = path.join(output, 'form-b-after-retake.pdf'); await (await individualEvent).saveAs(individualPath);
+    const comparison = JSON.parse(execFileSync(python, ['-c', [
+      'import json,sys; import fitz',
+      'before, after, individual = [fitz.open(filename) for filename in sys.argv[1:]]',
+      'pixels = lambda document, index: document[index].get_pixmap().samples',
+      'print(json.dumps({"otherPagesUnchanged":all(pixels(before,index)==pixels(after,index) for index in (0,1)),"retakenPageChanged":pixels(before,2)!=pixels(after,2),"individualMatchesCombined":pixels(after,2)==pixels(individual,0)}))',
+    ].join('\n'), combinedPath, refreshedPath, individualPath], { encoding: 'utf8' }));
+    assert.deepEqual(comparison, { otherPagesUnchanged: true, retakenPageChanged: true, individualMatchesCombined: true });
     assert.equal(requests.length, 2); assert.deepEqual(errors, []);
     const result = { ok: true, independentSubmitButtons: true, zeroPhotoSubmission: true, unfilledPageCounts: [2, 0],
       confirmationAndCancellation: true, duplicateClickRequestedOnce: true, otherFileRemainsEditable: true,
       stateSurvivesReload: true, researcherShowsPartialSubmission: true, combinedTemplatesMatchOriginal: true, combinedLastPagePhoto: true,
+      submittedRetakeWithoutResubmission: true, retakePersistsAfterReload: true, retakeUpdatesIndividualAndCombinedPdf: true,
       viewportWidths: [320, 390, 844, 1440], browserErrors: errors, localTestDataOnly: true };
     fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
   } finally { await context.close(); await browser.close(); }

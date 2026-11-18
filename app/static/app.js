@@ -79,17 +79,18 @@
   function setParticipantBusy(busy) {
     state.busy = busy;
     const submitted = state.participant?.status === "submitted";
-    const locked = busy || state.collecting || submitted;
+    const locked = busy || state.collecting;
     $("camera-button").disabled = locked; $("gallery-button").disabled = locked;
     photoQueue.setBusy(locked);
     $("upload-section").setAttribute("aria-busy", String(busy));
-    $("submit-button").disabled = locked || !state.participant || photoQueue.hasPending;
-    for (const button of document.querySelectorAll(".worksheet-submit")) button.disabled = locked || photoQueue.hasPending;
+    $("submit-button").disabled = locked || submitted || !state.participant || photoQueue.hasPending;
+    for (const button of document.querySelectorAll(".worksheet-submit")) button.disabled = locked || submitted || photoQueue.hasPending;
     for (const button of document.querySelectorAll(".worksheet-result-download")) button.disabled = busy || state.collecting;
-    if (state.participant) $("submit-hint").textContent = submitted ? "提出済みです。" : photoQueue.hasPending ? "一覧の写真を先に登録するか、一覧から外してください。" : state.participant.worksheet_submissions?.length > 1 ? "PDFごとに提出できます。未登録ページは未記入テンプレートで補います。" : "未登録ページは未記入テンプレートで補って提出できます。";
+    if (state.participant) $("submit-hint").textContent = photoQueue.hasPending ? "一覧の写真を先に登録するか、一覧から外してください。" : submitted ? "提出済みです。写真を登録し直すと、提出PDFも自動で更新されます。" : state.participant.worksheet_submissions?.length > 1 ? "PDFごとに提出できます。未登録ページは未記入テンプレートで補います。" : "未登録ページは未記入テンプレートで補って提出できます。";
   }
   function resumeUrl() { return `${location.origin}/#${state.token}`; }
   function renderParticipant(participant) {
+    const wasSubmitted = state.participant?.status === "submitted";
     state.participant = participant;
     if (participant.config) state.config = { ...state.config, ...participant.config };
     $("profile-banner").hidden = state.config.production_ready === true;
@@ -97,15 +98,15 @@
     $("participant-id").textContent = participant.participant_id;
     $("resume-link").value = resumeUrl();
     const submitted = participant.status === "submitted";
-    if (submitted) camera.stop();
+    if (submitted && !wasSubmitted) camera.stop();
     $("participant-heading-title").textContent = submitted ? "ご協力ありがとうございます" : "用紙を撮影して登録";
-    $("participant-lead").textContent = submitted ? "提出済みのデータを確認できます。" : "用紙をダウンロードし、印刷・記入してから撮影してください。用紙はどの順番からでも登録できます。";
+    $("participant-lead").textContent = submitted ? "提出済みのデータを確認できます。撮り直した写真を登録すると、提出PDFも自動で更新されます。" : "用紙をダウンロードし、印刷・記入してから撮影してください。用紙はどの順番からでも登録できます。";
     const worksheet = participant.worksheet;
     $("worksheet-unavailable").hidden = Boolean(worksheet?.available);
     $("worksheet-test-note").hidden = !worksheet?.is_test;
     $("worksheet-file-title").textContent = worksheet?.title || "";
     renderWorksheetDownloads(participant);
-    $("upload-section").hidden = submitted;
+    $("upload-section").hidden = false;
     $("submitted-panel").hidden = !submitted;
     $("submit-button").hidden = submitted || participant.worksheet_submissions?.length > 1;
     const blankCodes = new Set((participant.worksheet_submissions || []).flatMap(file => file.blank_qr_codes));
@@ -213,7 +214,7 @@
     try { result = await send(false); }
     catch (error) {
       if (error.status !== 409 || error.detail?.code !== "duplicate_page") throw error;
-      const yes = await confirmAction("登録済みのページです", `ページ ${error.detail.page_number || ""}（${error.detail.qr_code}）を新しい写真に差し替えますか？新しい画像の確認と保存が完了した後に更新されます。`, "差し替える");
+      const yes = await confirmAction("登録済みのページです", `ページ ${error.detail.page_number || ""}（${error.detail.qr_code}）を新しい写真に差し替えますか？新しい画像の確認と保存が完了した後に更新されます。提出済みの場合は、提出PDFも自動で更新されます。`, "差し替える");
       if (!yes) return { skipped: true };
       result = await send(true, error.detail.version);
     }
@@ -222,7 +223,7 @@
   }
 
   async function registerQueuedPhotos() {
-    if (state.busy || state.collecting || !state.token || !state.participant || state.participant.status === "submitted") return;
+    if (state.busy || state.collecting || !state.token || !state.participant) return;
     const entries = photoQueue.pending.slice();
     if (!entries.length) return;
     const token = state.token;
@@ -232,7 +233,7 @@
     setParticipantBusy(true); $("batch-progress").hidden = false;
     try {
       for (const [index, entry] of entries.entries()) {
-        if (state.token !== token || state.participant?.status === "submitted") break;
+        if (state.token !== token) break;
         $("batch-progress-label").textContent = `${index + 1} / ${entries.length}枚目のQR・四隅・画質を確認しています…`;
         photoQueue.mark(entry, "uploading");
         try {
@@ -243,13 +244,13 @@
           if (result.participant) renderParticipant(result.participant);
         } catch (error) {
           photoQueue.mark(entry, "failed", { error: error.message }); failed++;
-          if (error.status === 401 || error.status === 410 || error.detail?.code === "already_submitted") break;
+          if (error.status === 401 || error.status === 410) break;
         }
       }
       if (state.token === token) {
         try { await loadParticipant(); }
         catch { message("upload-error", "登録結果の一覧を更新できませんでした。登録済みの写真は保存されています。未登録の写真がある場合は、このページを閉じずに再試行してください。"); }
-        if (lastPage && state.participant?.status !== "submitted") {
+        if (lastPage) {
           try {
             const blob = await blobForPage(lastPage);
             if (state.previewObjectUrl) URL.revokeObjectURL(state.previewObjectUrl);
@@ -272,7 +273,7 @@
   }
 
   function addPhotos(files, source) {
-    if (state.busy || state.collecting || state.participant?.status === "submitted") return;
+    if (state.busy || state.collecting) return;
     const { added, rejected } = photoQueue.add(files, state.config.max_upload_mb || 25);
     message("upload-error", rejected.join(" "));
     if (!added.length) return;
@@ -283,7 +284,7 @@
   }
 
   async function capturePhoto() {
-    if (state.busy || state.collecting || state.participant?.status === "submitted") return;
+    if (state.busy || state.collecting) return;
     message("upload-error", "");
     if (!camera.supported) { $("camera-input").click(); return; }
     state.collecting = true; setParticipantBusy(false);
@@ -315,7 +316,7 @@
     setParticipantBusy(true); $("submit-button").textContent = "PDFを作成しています…"; message("app-error", "");
     try {
       const missing = file ? file.missing_page_count : state.config.pages.length - state.participant.pages.length;
-      const yes = await confirmAction(file ? `${file.number_label}を提出しますか？` : "この用紙を提出しますか？", `未登録の${missing}ページを、参加登録時の同じ用紙の未記入テンプレートで補います。提出後は、この用紙の写真を変更できません。${file ? "他の未提出の用紙は引き続き登録・提出できます。" : ""}`, "未記入を含めて提出する");
+      const yes = await confirmAction(file ? `${file.number_label}を提出しますか？` : "この用紙を提出しますか？", `未登録の${missing}ページを、参加登録時の同じ用紙の未記入テンプレートで補います。提出後も、撮り直した写真を登録すると提出PDFを自動で更新できます。${file ? "他の未提出の用紙は引き続き登録・提出できます。" : ""}`, "未記入を含めて提出する");
       if (!yes) return;
       await api(file ? file.submit_url : "/api/participant/submit", { method: "POST", participant: true });
       await loadParticipant(); $("latest-preview").hidden = true;

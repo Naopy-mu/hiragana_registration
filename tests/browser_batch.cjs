@@ -55,10 +55,10 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
     const files = images.map((data, index) => ({ name: `page-${index + 1}.jpg`, mimeType: 'image/jpeg', buffer: Buffer.from(data, 'base64') }));
     const saved = new Map(), requests = [], attempts = new Map();
     let active = 0, maxActive = 0, expiredOnce = false;
-    const photo = number => ({ page_number: number, qr_code: `TEST-0${number}`, version: 'v1', preview_url: `/api/participant/pages/TEST-0${number}/preview` });
-    if (mode.startsWith('duplicate')) saved.set(1, photo(1));
+    const photo = (number, version = 'v1') => ({ page_number: number, qr_code: `TEST-0${number}`, version, preview_url: `/api/participant/pages/TEST-0${number}/preview` });
+    if (mode.startsWith('duplicate') || mode.startsWith('submitted-gallery')) saved.set(1, photo(1));
     if (mode === 'submit-blocked') for (let i = 1; i <= 3; i++) saved.set(i, photo(i));
-    const participant = () => ({ participant_id: 'PTEST', status: 'registered', config, pages: [...saved.values()],
+    const participant = () => ({ participant_id: 'PTEST', status: mode.startsWith('submitted-') ? 'submitted' : 'registered', config, pages: [...saved.values()],
       missing_pages: config.pages.filter(item => !saved.has(item.page_number)).map(item => item.qr_code),
       worksheet: { available: true, title: '検証用紙', is_test: true, filename: 'test.pdf' } });
     await context.route('**/api/**', async route => {
@@ -82,7 +82,7 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
         if (mode === 'partial' && number === 2 && attempt === 1) return route.fulfill({ status: 422, json: { detail: { message: 'QRコードを確認してください。' } } });
         if (saved.has(number) && !replace) return route.fulfill({ status: 409, json: { detail: { code: 'duplicate_page', page_number: number, qr_code: `TEST-0${number}`, version: 'v1' } } });
         if (replace) assert.ok(/name="expected_version"\r\n\r\nv1/.test(body));
-        const entry = photo(number); saved.set(number, entry);
+        const entry = photo(number, replace ? 'v2' : 'v1'); saved.set(number, entry);
         return route.fulfill({ json: { page: entry, participant: participant() } });
       }
       throw new Error('Unexpected API request: ' + pathname);
@@ -194,6 +194,39 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
       assert.equal(requests.length, accept ? 3 : 2);
       assert.equal(requests.some(item => item.replace), accept);
       assert.equal(await page.locator('#queue-list [data-status="skipped"]').count(), accept ? 0 : 1);
+    });
+    for (const accept of [false, true]) await scenario(accept ? 'submitted-gallery-accept' : 'submitted-gallery-cancel', async ({ page, files, requests, saved }) => {
+      assert.equal(await page.locator('#submitted-panel').isVisible(), true);
+      assert.equal(await page.locator('#upload-section').isVisible(), true);
+      assert.equal(await page.locator('#gallery-button').isEnabled(), true);
+      assert.equal(await page.locator('#submit-button').isVisible(), false);
+      await page.locator('#gallery-input').setInputFiles(files.slice(0, 2)); await page.locator('#capture-next-register').click();
+      await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+      await page.locator(accept ? '#confirm-accept' : '#confirm-cancel').click(); await batchDone(page);
+      assert.equal(saved.size, 2, 'A submitted participant must process the rest of the queue after a duplicate');
+      assert.equal(requests.length, accept ? 3 : 2);
+      assert.equal(saved.get(1).version, accept ? 'v2' : 'v1');
+      assert.equal(await page.locator('#queue-list [data-status="saved"]').count(), accept ? 2 : 1);
+      assert.equal(await page.locator('#queue-list [data-status="skipped"]').count(), accept ? 0 : 1);
+      assert.equal(await page.locator('#latest-preview').isVisible(), true);
+      await page.locator('#preview-open').click(); await page.locator('#preview-dialog').waitFor({ state: 'visible' });
+      await page.locator('#close-preview').click();
+      assert.equal(await page.locator('#camera-button').isEnabled(), true);
+      await page.reload(); await page.locator('#submitted-panel').waitFor({ state: 'visible' });
+      assert.equal(await page.locator('#camera-button').isEnabled(), true);
+      assert.equal(await page.locator('#page-list .complete').count(), 2);
+    });
+    await scenario('submitted-camera', async ({ page, requests }) => {
+      await page.locator('#camera-button').click(); await page.locator('#camera-shutter:not([disabled])').waitFor();
+      await page.locator('#camera-shutter').click(); await page.locator('#capture-next-continue').click();
+      await page.locator('#camera-shutter:not([disabled])').waitFor(); await page.locator('#camera-shutter').click();
+      assert.equal(await page.evaluate(() => batchCamera.requests), 1);
+      await page.locator('#capture-next-register').click(); await batchDone(page);
+      assert.equal(requests.length, 2);
+      assert.equal(await page.locator('#queue-list [data-status="saved"]').count(), 2);
+      assert.equal(await page.locator('#submitted-panel').isVisible(), true);
+      assert.equal(await page.locator('#latest-preview').isVisible(), true);
+      assert.equal(await page.locator('#camera-button').isEnabled(), true);
     });
     await scenario('preview-error', async ({ page, files, requests }) => {
       await page.locator('#gallery-input').setInputFiles(files); await page.locator('#capture-next-register').click(); await batchDone(page);

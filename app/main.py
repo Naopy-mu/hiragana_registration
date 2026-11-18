@@ -285,6 +285,42 @@ def create_app(settings: Settings | None = None, storage_override=None):
             fail(404, 'worksheet_unavailable', 'この参加者の配布対象に含まれていないPDFです。')
         return worksheet_pdf(str(worksheet_id))
 
+    def refresh_submitted_pdf(s, participant, pages, file_id, new_keys, old_keys):
+        rows = submission_rows(s, participant)
+        if file_id not in rows and participant.status != 'submitted':
+            return
+        groups = worksheet_groups(participant, registry)
+        present = {page.qr_code for page in pages}
+        for group in groups:
+            row = rows.get(group['id'])
+            if group['id'] != file_id and (row is not None or participant.status != 'submitted'):
+                continue
+            data = make_pdf(participant, pages, storage, group['pages'], registry)
+            name = worksheet_pdf_name(participant, group, len(groups))
+            key = f'{participant.participant_id}/{participant.submission_id}/{uuid.uuid4()}/{name}'
+            new_keys.append(key)
+            storage.put(key, data, 'application/pdf')
+            if row is None:
+                # Materialize every legacy worksheet before changing the combined PDF's layout.
+                row = WorksheetSubmission(submission_id=participant.submission_id, worksheet_id=group['id'],
+                                          submitted_at=participant.submitted_at or now())
+                s.add(row)
+                rows[group['id']] = row
+            else:
+                old_keys.append(row.pdf_path)
+            row.pdf_path = key
+            row.blank_qrs_json = json.dumps([page['qr_code'] for page in group['pages'] if page['qr_code'] not in present])
+        if participant.status == 'submitted':
+            old_keys.append(participant.pdf_path)
+            if len(groups) > 1:
+                combined = make_pdf(participant, pages, storage, registry.manifest_for(participant)['pages'], registry)
+                key = f'{participant.participant_id}/{participant.submission_id}/{uuid.uuid4()}/{participant.participant_id}.pdf'
+                new_keys.append(key)
+                storage.put(key, combined, 'application/pdf')
+            else:
+                key = rows[groups[0]['id']].pdf_path
+            participant.pdf_path = key
+
     @app.post('/api/participant/pages')
     def upload(file: UploadFile = File(...), replace: bool = Form(False), expected_version: str | None = Form(None), participant=Depends(participant_auth)):
         from app.imaging import ImageValidationError, process_image
@@ -292,8 +328,6 @@ def create_app(settings: Settings | None = None, storage_override=None):
         data = file.file.read(settings.max_upload_mb * 1024 * 1024 + 1)
         if len(data) > settings.max_upload_mb * 1024 * 1024:
             fail(413, 'file_too_large', f'{settings.max_upload_mb}MB以内の画像を選んでください。')
-        if participant.status == 'submitted':
-            fail(409, 'already_submitted', '提出済みのため変更できません。')
         with image_slots:
             try:
                 processed = process_image(data, study_manifest)
@@ -301,16 +335,13 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 fail(422, e.code, e.message)
         new_keys, old_keys = [], []
         try:
-            with db.write() as s:
+            # Match submit_files' lock order when rebuilding a submitted PDF.
+            with pdf_slots, db.write() as s:
                 current = s.scalar(select(Participant).where(Participant.id == participant.id).with_for_update())
                 if current is None:
                     registration_expired()
-                if current.status == 'submitted':
-                    fail(409, 'already_submitted', '提出済みのため変更できません。')
                 configured = next(page for page in study_manifest['pages'] if page['qr_code'] == processed.qr_code)
                 file_id = configured.get('worksheet_id', current.worksheet_revision_id)
-                if s.get(WorksheetSubmission, (current.submission_id, file_id)):
-                    fail(409, 'worksheet_submitted', 'この用紙は提出済みのため変更できません。他の未提出の用紙は登録できます。')
                 existing = s.scalar(select(Page).where(Page.submission_id == current.submission_id, Page.qr_code == processed.qr_code))
                 if existing and not replace:
                     fail(409, 'duplicate_page', 'このページは登録済みです。新しい写真に差し替えますか？', qr_code=processed.qr_code, page_number=processed.page_number, version=existing.version)
@@ -337,7 +368,10 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 page.version = object_id
                 page.created_at = now()
                 s.flush()
-                result = {'page': page_data(page, study_manifest), 'participant': participant_data(current, get_pages(s, current), s)}
+                pages = get_pages(s, current)
+                refresh_submitted_pdf(s, current, pages, file_id, new_keys, old_keys)
+                s.flush()
+                result = {'page': page_data(page, study_manifest), 'participant': participant_data(current, pages, s)}
         except CommitUncertain:
             log.warning('Page commit uncertain; retain storage objects and retry from participant view.')
             fail(503, 'commit_uncertain', '通信が中断されました。一覧を更新して登録状況を確認してください。')
@@ -347,8 +381,8 @@ def create_app(settings: Settings | None = None, storage_override=None):
         except Exception:
             clean(new_keys)
             log.exception('Page persistence failed')
-            fail(503, 'storage_failed', '保存できませんでした。元の登録画像は維持されています。もう一度お試しください。')
-        clean(old_keys)
+            fail(503, 'storage_failed', '保存できませんでした。元の登録画像と提出PDFは維持されています。もう一度お試しください。')
+        clean(set(old_keys))
         return result
 
     @app.get('/api/participant/pages/{qr_code}/preview')
@@ -447,7 +481,20 @@ def create_app(settings: Settings | None = None, storage_override=None):
     def participant_pdf(participant=Depends(participant_auth)):
         if participant.status != 'submitted' or not participant.pdf_path:
             fail(404, 'pdf_missing', '提出後にPDFを取得できます。')
-        return Response(storage.get(participant.pdf_path), media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{participant.participant_id}.pdf"'})
+        try:
+            data = storage.get(participant.pdf_path)
+        except Exception:
+            # A concurrent retake may have replaced and removed the authenticated snapshot's PDF.
+            with db.read() as s:
+                current = s.get(Participant, participant.id)
+                key = current.pdf_path if current else None
+            if not key or key == participant.pdf_path:
+                fail(503, 'storage_failed', '提出PDFを取得できませんでした。再度お試しください。')
+            try:
+                data = storage.get(key)
+            except Exception:
+                fail(503, 'storage_failed', '提出PDFを取得できませんでした。再度お試しください。')
+        return Response(data, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{participant.participant_id}.pdf"'})
 
     @app.post('/api/researcher/login')
     def login(body: Login, request: Request, response: Response):
