@@ -545,8 +545,21 @@ def test_independent_partial_submission_templates_and_other_file_remains_editabl
     filled_state = filled.json()['participant']
     assert filled_state['status'] == 'partially_submitted'
     assert [file['status'] for file in filled_state['worksheet_submissions']] == ['submitted', 'registered']
-    assert filled_state['blank_page_count'] == 0
+    assert filled_state['blank_page_count'] == 1
+    assert filled_state['has_pending_changes'] and filled_state['pending_page_count'] == 1
+    assert filled_state['worksheet_submissions'][0]['pending_qr_codes'] == ['HIRA1-02']
     assert filled_state['worksheet_submissions'][0]['submitted_at'] == state['worksheet_submissions'][0]['submitted_at']
+    assert client.get(state['worksheet_submissions'][0]['pdf_url'], headers=auth).content == data
+    export = client.post('/api/researcher/download', headers=csrf, json={'scope': 'submitted', 'types': ['pdf', 'csv']})
+    assert export.status_code == 200, export.text
+    with ZipFile(io.BytesIO(export.content)) as archive:
+        assert archive.read(f'{pid}/{pid}_01.pdf') == data
+        rows = list(csv.DictReader(io.StringIO(archive.read(f'{pid}/mapping.csv').decode('utf-8-sig'))))
+        assert [row['page_status'] for row in rows] == ['submitted', 'registered', 'not_registered']
+    assert client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth).status_code == 200
+    resubmitted = client.get('/api/participant', headers=auth).json()
+    assert not resubmitted['has_pending_changes'] and resubmitted['blank_page_count'] == 0
+    assert resubmitted['worksheet_submissions'][0]['submitted_at'] != state['worksheet_submissions'][0]['submitted_at']
     updated = client.get(state['worksheet_submissions'][0]['pdf_url'], headers=auth).content
     assert_submitted_photo(client, auth, updated, 1, filled.json()['page'])
     assert client.get('/api/participant/pdf', headers=auth).status_code == 404
@@ -580,6 +593,8 @@ def test_submitted_retake_updates_target_and_combined_but_keeps_other_pdf(revisi
     assert client.post('/api/participant/submit', headers=auth).status_code == 200
     state = client.get('/api/participant', headers=auth).json()
     result_urls = [file['pdf_url'] for file in state['worksheet_submissions']]
+    previous_target = client.get(result_urls[0], headers=auth).content
+    previous_combined = client.get('/api/participant/pdf', headers=auth).content
     other_pdf = client.get(result_urls[1], headers=auth).content
     with revision_harness[1].state.db.read() as session:
         participant = session.scalar(select(Participant))
@@ -594,8 +609,16 @@ def test_submitted_retake_updates_target_and_combined_but_keeps_other_pdf(revisi
     assert replaced.status_code == 200, replaced.text
     page, updated = replaced.json()['page'], replaced.json()['participant']
     assert updated['status'] == 'submitted' and updated['submitted_worksheet_count'] == 2
+    assert updated['has_pending_changes'] and updated['pending_page_count'] == 1
     assert updated['blank_page_count'] == state['blank_page_count'] == 2
     assert [file['submitted_at'] for file in updated['worksheet_submissions']] == [file['submitted_at'] for file in state['worksheet_submissions']]
+    assert client.get(result_urls[0], headers=auth).content == previous_target
+    assert client.get('/api/participant/pdf', headers=auth).content == previous_combined
+    assert client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth).status_code == 200
+    completed = client.get('/api/participant', headers=auth).json()
+    assert not completed['has_pending_changes']
+    assert completed['worksheet_submissions'][0]['submitted_at'] != state['worksheet_submissions'][0]['submitted_at']
+    assert completed['worksheet_submissions'][1]['submitted_at'] == state['worksheet_submissions'][1]['submitted_at']
     target_pdf = client.get(result_urls[0], headers=auth).content
     combined = client.get('/api/participant/pdf', headers=auth).content
     assert_submitted_photo(client, auth, target_pdf, 0, page)
@@ -618,11 +641,53 @@ def test_submitted_retake_updates_target_and_combined_but_keeps_other_pdf(revisi
         assert archive.read(f'{pid}/{pid}_02.pdf') == other_pdf
 
 
+def test_individual_resubmission_keeps_other_worksheet_draft_out_of_combined_pdf(revision_harness, separate_pdfs, form_photos):
+    import csv
+    from zipfile import ZipFile
+    client, csrf, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    assert client.post('/api/participant/submit', headers=auth).status_code == 200
+    before = client.get('/api/participant', headers=auth).json()
+    other_url = before['worksheet_submissions'][1]['pdf_url']
+    other_pdf = client.get(other_url, headers=auth).content
+    staged = []
+    for index in (0, 2):
+        response = client.post('/api/participant/pages', headers=auth,
+                               files={'file': ('additional.jpg', form_photos[index], 'image/jpeg')})
+        assert response.status_code == 200, response.text
+        staged.append(response.json()['page'])
+    draft = client.get('/api/participant', headers=auth).json()
+    assert draft['pending_page_count'] == 2 and draft['blank_page_count'] == 3
+    assert client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth).status_code == 200
+    state = client.get('/api/participant', headers=auth).json()
+    assert state['has_pending_changes'] and state['pending_page_count'] == 1
+    assert [file['has_pending_changes'] for file in state['worksheet_submissions']] == [False, True]
+    assert state['blank_page_count'] == 2
+    assert client.get(other_url, headers=auth).content == other_pdf
+    combined = client.get('/api/participant/pdf', headers=auth).content
+    assert_submitted_photo(client, auth, combined, 0, staged[0])
+    assert_template_page(combined, 1, separate_pdfs[1])
+    assert_template_page(combined, 2, separate_pdfs[2])
+    export = client.post('/api/researcher/download', headers=csrf, json={'scope': 'submitted', 'types': ['pdf', 'csv']})
+    assert export.status_code == 200, export.text
+    with ZipFile(io.BytesIO(export.content)) as archive:
+        pid = state['participant_id']
+        assert archive.read(f'{pid}/{pid}.pdf') == combined
+        rows = list(csv.DictReader(io.StringIO(archive.read(f'{pid}/mapping.csv').decode('utf-8-sig'))))
+        assert [row['page_status'] for row in rows] == ['submitted', 'blank', 'registered']
+    assert client.post(f'/api/participant/worksheets/{ids[1]}/submit', headers=auth).status_code == 200
+    completed = client.get('/api/participant', headers=auth).json()
+    assert not completed['has_pending_changes'] and completed['blank_page_count'] == 1
+    updated_combined = client.get('/api/participant/pdf', headers=auth).content
+    assert_submitted_photo(client, auth, updated_combined, 0, staged[0])
+    assert_submitted_photo(client, auth, updated_combined, 2, staged[1])
+    assert_template_page(updated_combined, 1, separate_pdfs[1])
+
+
 @pytest.mark.parametrize('failed_pdf', ['worksheet', 'combined'])
 def test_submitted_photo_pdf_failure_keeps_all_previous_data(revision_harness, separate_pdfs, form_photos, monkeypatch, failed_pdf):
     from app.database import Page, Participant, WorksheetSubmission
     from sqlalchemy import select
-    client, _, auth, _ = partial_setup(revision_harness, separate_pdfs)
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
     assert client.post('/api/participant/submit', headers=auth).status_code == 200
     before = client.get('/api/participant', headers=auth).json()
     urls = [file['pdf_url'] for file in before['worksheet_submissions']] + ['/api/participant/pdf']
@@ -639,20 +704,27 @@ def test_submitted_photo_pdf_failure_keeps_all_previous_data(revision_harness, s
             raise OSError('Simulated submitted-PDF update failure')
         return put(key, data, content_type)
     monkeypatch.setattr(storage, 'put', fail_put)
-    failed = client.post('/api/participant/pages', headers=auth,
+    staged = client.post('/api/participant/pages', headers=auth,
                          files={'file': ('added.jpg', form_photos[0], 'image/jpeg')})
+    assert staged.status_code == 200, staged.text
+    assert not any(key.endswith('.pdf') for key in attempted), 'Draft registration must not write a PDF'
+    draft_state = client.get('/api/participant', headers=auth).json()
+    assert draft_state['has_pending_changes'] and draft_state['blank_page_count'] == before['blank_page_count']
+    attempted.clear()
+    failed = client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth)
     assert failed.status_code == 503
-    assert client.get('/api/participant', headers=auth).json() == before
+    assert client.get('/api/participant', headers=auth).json() == draft_state
     assert [client.get(url, headers=auth).content for url in urls] == old_pdfs
     assert all(storage.path(path).is_file() for path in old_paths)
     assert all(not storage.path(path).exists() for path in attempted)
     with app.state.db.read() as session:
-        assert list(session.scalars(select(Page))) == []
+        assert len(list(session.scalars(select(Page)))) == 1
     monkeypatch.setattr(storage, 'put', put)
-    retry = client.post('/api/participant/pages', headers=auth,
-                        files={'file': ('added.jpg', form_photos[0], 'image/jpeg')})
+    retry = client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth)
     assert retry.status_code == 200, retry.text
-    assert retry.json()['participant']['blank_page_count'] == before['blank_page_count'] - 1
+    completed = client.get('/api/participant', headers=auth).json()
+    assert completed['blank_page_count'] == before['blank_page_count'] - 1
+    assert not completed['has_pending_changes']
 
 
 def test_zero_photo_individual_submission_is_protected_from_expiry(revision_harness, separate_pdfs):
@@ -827,9 +899,16 @@ def test_legacy_combined_submission_is_read_and_can_be_retaken(revision_harness,
     assert replacement.status_code == 200, replacement.text
     updated = replacement.json()['participant']
     assert updated['status'] == 'submitted' and updated['submitted_worksheet_count'] == 2
+    assert updated['has_pending_changes'] and updated['pending_page_count'] == 1
     assert updated['blank_page_count'] == int(missing_first)
     assert replacement.json()['page']['version'] != old_page['version']
     assert [file['submitted_at'] for file in updated['worksheet_submissions']] == [file['submitted_at'] for file in state['worksheet_submissions']]
+    assert client.get('/api/participant/pdf', headers=auth).content == before
+    target_id = ids[1] if missing_first else ids[0]
+    submitted = client.post(f'/api/participant/worksheets/{target_id}/submit', headers=auth)
+    assert submitted.status_code == 200, submitted.text
+    updated = client.get('/api/participant', headers=auth).json()
+    assert not updated['has_pending_changes']
     combined = client.get('/api/participant/pdf', headers=auth).content
     first = client.get(f'/api/participant/worksheets/{ids[0]}/submission', headers=auth).content
     second = client.get(f'/api/participant/worksheets/{ids[1]}/submission', headers=auth).content
@@ -844,5 +923,55 @@ def test_legacy_combined_submission_is_read_and_can_be_retaken(revision_harness,
     with revision_harness[1].state.db.read() as session:
         rows = list(session.scalars(select(WorksheetSubmission)))
         assert len(rows) == 2 and {row.worksheet_id for row in rows} == set(ids)
-        assert all(row.submitted_at == submitted_at for row in rows)
+        assert next(row for row in rows if row.worksheet_id == target_id).submitted_at != submitted_at
+        assert next(row for row in rows if row.worksheet_id != target_id).submitted_at == submitted_at
         assert session.scalar(select(Participant)).submitted_at == submitted_at
+
+
+def test_sparse_legacy_pdf_without_outline_keeps_old_positions_when_photo_is_added(revision_harness, separate_pdfs, form_photos):
+    from app.database import Participant, WorksheetSubmission
+    from sqlalchemy import delete, select
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    old_pages = []
+    for index in (1, 2):
+        uploaded = client.post('/api/participant/pages', headers=auth,
+                               files={'file': ('old.jpg', form_photos[index], 'image/jpeg')})
+        assert uploaded.status_code == 200, uploaded.text
+        old_pages.append(uploaded.json()['page'])
+    assert client.post('/api/participant/submit', headers=auth).status_code == 200
+    source = PdfReader(io.BytesIO(client.get('/api/participant/pdf', headers=auth).content))
+    writer, output = PdfWriter(), io.BytesIO()
+    for index in (1, 2):
+        writer.add_page(source.pages[index])
+    writer.write(output)
+    sparse_pdf = output.getvalue()
+    assert len(PdfReader(io.BytesIO(sparse_pdf)).pages) == 2
+    assert PdfReader(io.BytesIO(sparse_pdf)).outline == []
+    app, storage = revision_harness[1], revision_harness[3]
+    with app.state.db.write() as session:
+        participant = session.scalar(select(Participant))
+        legacy_path = f'{participant.participant_id}/{participant.submission_id}/legacy-without-outline.pdf'
+        storage.put(legacy_path, sparse_pdf, 'application/pdf')
+        participant.pdf_path = legacy_path
+        session.execute(delete(WorksheetSubmission))
+    added = client.post('/api/participant/pages', headers=auth,
+                        files={'file': ('added-first-page.jpg', form_photos[0], 'image/jpeg')})
+    assert added.status_code == 200, added.text
+    assert added.json()['participant']['pending_page_count'] == 1
+    assert client.get('/api/participant/pdf', headers=auth).content == sparse_pdf
+    first = client.get(f'/api/participant/worksheets/{ids[0]}/submission', headers=auth)
+    second = client.get(f'/api/participant/worksheets/{ids[1]}/submission', headers=auth)
+    assert first.status_code == second.status_code == 200
+    assert_submitted_photo(client, auth, first.content, 1, old_pages[0])
+    assert_submitted_photo(client, auth, second.content, 0, old_pages[1])
+    submitted = client.post(f'/api/participant/worksheets/{ids[0]}/submit', headers=auth)
+    assert submitted.status_code == 200, submitted.text
+    completed = client.get('/api/participant', headers=auth).json()
+    assert not completed['has_pending_changes'] and completed['blank_page_count'] == 0
+    combined = client.get('/api/participant/pdf', headers=auth).content
+    assert len(PdfReader(io.BytesIO(combined)).pages) == 3
+    for page in [added.json()['page'], *old_pages]:
+        assert_submitted_photo(client, auth, combined, page['page_number'] - 1, page)
+    assert_submitted_photo(client, auth,
+                           client.get(f'/api/participant/worksheets/{ids[1]}/submission', headers=auth).content,
+                           0, old_pages[1])

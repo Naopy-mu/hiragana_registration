@@ -17,12 +17,13 @@ execFileSync(python, ['-c', [
   '    writer = PdfWriter()',
   '    for index in indexes: writer.add_page(reader.pages[index])',
   '    writer.write(folder / name)',
-  'with fitz.open(source) as document:',
-  '    pix = document[2].get_pixmap(matrix=fitz.Matrix(2, 2)); page = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)',
-  'pen = ImageDraw.Draw(page)',
-  'for y in range(250,1350,35):',
-  '    for x in range(180,1000,60): pen.line([(x,y),(x+20,y+20),(x+40,y+3)],fill=(75,75,75),width=3)',
-  'photo = Image.new("RGB", (page.width+200,page.height+200), "white"); photo.paste(page,(100,100)); photo.save(folder/"photo-b.jpg",quality=95)',
+  'for page_index, name in [(0, "photo-a.jpg"), (2, "photo-b.jpg")]:',
+  '    with fitz.open(source) as document:',
+  '        pix = document[page_index].get_pixmap(matrix=fitz.Matrix(2, 2)); page = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)',
+  '    pen = ImageDraw.Draw(page)',
+  '    for y in range(250,1350,35):',
+  '        for x in range(180,1000,60): pen.line([(x,y),(x+20,y+20),(x+40,y+3)],fill=(75,75,75),width=3)',
+  '    photo = Image.new("RGB", (page.width+200,page.height+200), "white"); photo.paste(page,(100,100)); photo.save(folder/name,quality=95)',
   'ImageDraw.Draw(photo).line([(350,350),(900,600)],fill=(30,30,30),width=12); photo.save(folder/"photo-b-retake.jpg",quality=95)',
 ].join('\n'), root, output]);
 
@@ -99,22 +100,44 @@ execFileSync(python, ['-c', [
       const response = await context.request.get(base + '/api/participant', { headers: { Authorization: `Bearer ${token}` } });
       assert.equal(response.status(), 200); return response.json();
     };
+    const getPdf = async url => {
+      const response = await context.request.get(base + url, { headers: { Authorization: `Bearer ${token}` } });
+      assert.equal(response.status(), 200); return response.body();
+    };
     const beforeRetake = await getParticipant();
+    const previousIndividual = await getPdf(beforeRetake.worksheet_submissions[1].pdf_url);
     assert.equal(await page.locator('#camera-button').isEnabled(), true);
     assert.equal(await page.locator('#gallery-button').isEnabled(), true);
-    await page.locator('#gallery-input').setInputFiles(path.join(output, 'photo-b-retake.jpg'));
+    await page.locator('#gallery-input').setInputFiles([path.join(output, 'photo-b-retake.jpg'), path.join(output, 'photo-a.jpg')]);
     await page.locator('#capture-next-register').click();
     await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
     assert.match(await page.locator('#confirm-description').textContent(), /HIRA1-03/);
     await page.locator('#confirm-accept').click();
-    await page.waitForFunction(() => document.getElementById('batch-progress').hidden && document.getElementById('batch-status').textContent.includes('1枚を登録しました'));
-    assert.equal(await page.locator('#latest-preview').isVisible(), true);
+    await page.waitForFunction(() => document.getElementById('batch-progress').hidden && document.getElementById('batch-status').textContent.includes('2枚を登録しました'));
+    await page.locator('#latest-preview').waitFor({ state: 'visible' });
     await page.reload(); await page.locator('#submitted-panel').waitFor({ state: 'visible' });
     const afterRetake = await getParticipant();
     assert.equal(afterRetake.status, 'submitted');
-    assert.notEqual(afterRetake.pages[0].version, beforeRetake.pages[0].version);
+    assert.equal(afterRetake.has_pending_changes, true);
+    assert.equal(afterRetake.pending_page_count, 2);
+    assert.notEqual(afterRetake.pages.find(photo => photo.qr_code === 'HIRA1-03').version, beforeRetake.pages[0].version);
     assert.deepEqual(afterRetake.worksheet_submissions.map(file => [file.id, file.status, file.submitted_at, file.blank_pages]),
       beforeRetake.worksheet_submissions.map(file => [file.id, file.status, file.submitted_at, file.blank_pages]));
+    assert.deepEqual(await getPdf('/api/participant/pdf'), fs.readFileSync(combinedPath), 'Registration and reload must retain the previous combined submission');
+    assert.deepEqual(await getPdf(afterRetake.worksheet_submissions[1].pdf_url), previousIndividual);
+    assert.equal(await first.locator('.worksheet-submit').isEnabled(), true);
+    assert.match(await second.locator('.worksheet-submit').textContent(), /追加分を提出する/);
+    assert.ok(Number(await page.locator('.progress-track').getAttribute('aria-valuenow')) <= 100, 'A photo for a submitted template must not be counted twice');
+    await second.locator('.worksheet-submit').click();
+    await page.locator('#confirm-accept').click();
+    await second.locator('.worksheet-submit').waitFor({ state: 'hidden' });
+    const afterSecondSubmit = await getParticipant();
+    assert.equal(afterSecondSubmit.has_pending_changes, true);
+    assert.equal(afterSecondSubmit.pending_page_count, 1);
+    assert.equal(afterSecondSubmit.worksheet_submissions[0].has_pending_changes, true);
+    assert.equal(afterSecondSubmit.worksheet_submissions[1].has_pending_changes, false);
+    assert.equal(afterSecondSubmit.worksheet_submissions[0].submitted_at, beforeRetake.worksheet_submissions[0].submitted_at);
+    assert.notEqual(afterSecondSubmit.worksheet_submissions[1].submitted_at, beforeRetake.worksheet_submissions[1].submitted_at);
     const refreshedEvent = page.waitForEvent('download'); await page.locator('#download-pdf').click();
     const refreshedPath = path.join(output, 'combined-after-retake.pdf'); await (await refreshedEvent).saveAs(refreshedPath);
     const individualEvent = page.waitForEvent('download'); await second.locator('.worksheet-result-download').click();
@@ -126,11 +149,27 @@ execFileSync(python, ['-c', [
       'print(json.dumps({"otherPagesUnchanged":all(pixels(before,index)==pixels(after,index) for index in (0,1)),"retakenPageChanged":pixels(before,2)!=pixels(after,2),"individualMatchesCombined":pixels(after,2)==pixels(individual,0)}))',
     ].join('\n'), combinedPath, refreshedPath, individualPath], { encoding: 'utf8' }));
     assert.deepEqual(comparison, { otherPagesUnchanged: true, retakenPageChanged: true, individualMatchesCombined: true });
-    assert.equal(requests.length, 2); assert.deepEqual(errors, []);
+    await first.locator('.worksheet-submit').click();
+    await page.locator('#confirm-accept').click();
+    await first.locator('.worksheet-submit').waitFor({ state: 'hidden' });
+    const finalState = await getParticipant();
+    assert.equal(finalState.has_pending_changes, false);
+    assert.equal(finalState.blank_page_count, 1);
+    const finalEvent = page.waitForEvent('download'); await page.locator('#download-pdf').click();
+    const finalPath = path.join(output, 'combined-after-additional-submissions.pdf'); await (await finalEvent).saveAs(finalPath);
+    const finalComparison = JSON.parse(execFileSync(python, ['-c', [
+      'import json,sys; import fitz',
+      'previous, after = [fitz.open(filename) for filename in sys.argv[1:]]',
+      'pixels = lambda document, index: document[index].get_pixmap().samples',
+      'print(json.dumps({"addedPageChanged":pixels(previous,0)!=pixels(after,0),"otherPagesUnchanged":all(pixels(previous,index)==pixels(after,index) for index in (1,2))}))',
+    ].join('\n'), refreshedPath, finalPath], { encoding: 'utf8' }));
+    assert.deepEqual(finalComparison, { addedPageChanged: true, otherPagesUnchanged: true });
+    assert.equal(requests.length, 4); assert.deepEqual(errors, []);
     const result = { ok: true, independentSubmitButtons: true, zeroPhotoSubmission: true, unfilledPageCounts: [2, 0],
       confirmationAndCancellation: true, duplicateClickRequestedOnce: true, otherFileRemainsEditable: true,
       stateSurvivesReload: true, researcherShowsPartialSubmission: true, combinedTemplatesMatchOriginal: true, combinedLastPagePhoto: true,
-      submittedRetakeWithoutResubmission: true, retakePersistsAfterReload: true, retakeUpdatesIndividualAndCombinedPdf: true,
+      registrationKeepsSubmittedPdf: true, pendingChangesSurviveReload: true, explicitSubmissionUpdatesIndividualAndCombinedPdf: true,
+      otherWorksheetDraftExcludedFromCombinedPdf: true, submittedTemplateFilledAfterAdditionalSubmission: true,
       viewportWidths: [320, 390, 844, 1440], browserErrors: errors, localTestDataOnly: true };
     fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
   } finally { await context.close(); await browser.close(); }

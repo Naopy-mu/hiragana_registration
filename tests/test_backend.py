@@ -282,11 +282,6 @@ def test_duplicate_replacement_preserves_old_data_until_new_save_succeeds(harnes
     if submitted:
         assert client.get("/api/participant/pdf", headers=auth(participant)).content == old_pdf
         storage.fail_content_type = "application/pdf"
-        failed_pdf = upload(client, participant, replacement_photo, replace="true", expected_version=old_page["version"])
-        assert failed_pdf.status_code == 503
-        assert client.get("/api/participant", headers=auth(participant)).json() == old_state
-        assert client.get("/api/participant/pdf", headers=auth(participant)).content == old_pdf
-        assert client.get(old_page["preview_url"], headers=auth(participant)).content == old_preview
     successful = upload(client, participant, replacement_photo, replace="true", expected_version=old_page["version"])
     assert successful.status_code == 200, successful.text
     assert successful.json()["page"]["version"] != old_page["version"]
@@ -295,7 +290,20 @@ def test_duplicate_replacement_preserves_old_data_until_new_save_succeeds(harnes
     if submitted:
         state = successful.json()["participant"]
         assert state["status"] == "submitted" and state["blank_page_count"] == 2
+        assert state["has_pending_changes"] and state["pending_page_count"] == 1
+        assert state["worksheet_submissions"][0]["pending_qr_codes"] == ["HIRA1-01"]
         assert state["worksheet_submissions"][0]["submitted_at"] == old_state["worksheet_submissions"][0]["submitted_at"]
+        assert storage.fail_content_type == "application/pdf", "Registering a draft must not write a PDF"
+        assert client.get("/api/participant/pdf", headers=auth(participant)).content == old_pdf
+        assert client.get("/api/participant", headers=auth(participant)).json() == state
+        failed_pdf = client.post("/api/participant/submit", headers=auth(participant))
+        assert failed_pdf.status_code == 503
+        assert client.get("/api/participant", headers=auth(participant)).json() == state
+        assert client.get("/api/participant/pdf", headers=auth(participant)).content == old_pdf
+        assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+        completed = client.get("/api/participant", headers=auth(participant)).json()
+        assert not completed["has_pending_changes"] and completed["pending_page_count"] == 0
+        assert completed["worksheet_submissions"][0]["submitted_at"] != old_state["worksheet_submissions"][0]["submitted_at"]
         updated_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
         preview = client.get(old_page["preview_url"], headers=auth(participant)).content
         assert preview != old_preview
@@ -316,6 +324,7 @@ def test_concurrent_submitted_replacement_accepts_only_one_expected_version(harn
     participant = register(client)
     initial = upload(client, participant, photos[1]).json()["page"]
     assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    previous_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(lambda _: upload(client, participant, replacement_photo,
                                                    replace="true", expected_version=initial["version"]), range(2)))
@@ -324,11 +333,54 @@ def test_concurrent_submitted_replacement_accepts_only_one_expected_version(harn
     assert rejected.json()["detail"]["code"] == "version_conflict"
     state = client.get("/api/participant", headers=auth(participant)).json()
     assert state["status"] == "submitted" and len(state["pages"]) == 1
+    assert state["has_pending_changes"] and state["pending_page_count"] == 1
+    assert client.get("/api/participant/pdf", headers=auth(participant)).content == previous_pdf
     with app.state.db.read() as session:
         assert session.scalar(select(func.count()).select_from(Page)) == 1
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
     data = client.get("/api/participant/pdf", headers=auth(participant)).content
     preview = client.get(state["pages"][0]["preview_url"], headers=auth(participant)).content
     assert_pdf_photo_matches_preview(data, 0, preview)
+
+
+def test_draft_registration_skips_pdf_work_and_resubmission_reuses_previous_pages(harness, photos, replacement_photo, monkeypatch):
+    client, app, storage = harness
+    participant = register(client)
+    for number in (1, 2, 3):
+        assert upload(client, participant, photos[number]).status_code == 200
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    state = client.get("/api/participant", headers=auth(participant)).json()
+    old_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+    with app.state.db.read() as session:
+        old_pngs = {page.corrected_path for page in session.scalars(select(Page))}
+    original_get, reads = storage.get, []
+
+    def track_reads(key):
+        reads.append(key)
+        return original_get(key)
+
+    monkeypatch.setattr(storage, "get", track_reads)
+    staged = upload(client, participant, replacement_photo, replace="true", expected_version=state["pages"][0]["version"])
+    assert staged.status_code == 200, staged.text
+    assert reads == [], "Registering a photo must not read earlier PDFs or corrected photographs"
+    assert staged.json()["participant"]["has_pending_changes"]
+    with app.state.db.read() as session:
+        new_png = session.scalar(select(Page.corrected_path).where(Page.page_number == 1))
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    assert not old_pngs.intersection(reads), "Unchanged pages must come from the previous PDF"
+    assert reads.count(new_png) == 1
+    updated_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+    import fitz
+    with fitz.open(stream=old_pdf, filetype="pdf") as before, fitz.open(stream=updated_pdf, filetype="pdf") as after:
+        for index in (1, 2):
+            assert before[index].get_pixmap().samples == after[index].get_pixmap().samples
+        assert before[0].get_pixmap().samples != after[0].get_pixmap().samples
+    no_changes = client.get("/api/participant", headers=auth(participant)).json()
+    assert not no_changes["has_pending_changes"]
+    reads.clear()
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    assert reads == [], "Retrying without new changes must not rebuild a PDF"
+    assert client.get("/api/participant/pdf", headers=auth(participant)).content == updated_pdf
 
 
 def test_pdf_download_recovers_when_replacement_removes_authenticated_pdf(harness, photos, replacement_photo, monkeypatch):
@@ -352,6 +404,7 @@ def test_pdf_download_recovers_when_replacement_removes_authenticated_pdf(harnes
             response = upload(client, participant, replacement_photo,
                               replace="true", expected_version=old_page["version"])
             assert response.status_code == 200, response.text
+            assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
             assert not storage.path(old_pdf_key).exists()
         return original_get(key)
 
@@ -362,7 +415,7 @@ def test_pdf_download_recovers_when_replacement_removes_authenticated_pdf(harnes
     with app.state.db.read() as session:
         latest_pdf_key = session.scalar(select(Participant.pdf_path))
     assert latest_pdf_key != old_pdf_key
-    assert reads.count(old_pdf_key) == 1 and reads.count(latest_pdf_key) == 1
+    assert old_pdf_key in reads and reads[-1] == latest_pdf_key
     assert response.content == original_get(latest_pdf_key)
     preview = client.get(old_page["preview_url"], headers=auth(participant))
     assert preview.status_code == 200, preview.text
@@ -456,7 +509,14 @@ def test_lost_commit_acknowledgement_preserves_committed_page_and_pdf(harness, p
     assert uncertain_replacement.json()["detail"]["code"] == "commit_uncertain"
     state = client.get("/api/participant", headers=auth(participant)).json()
     assert state["status"] == "submitted" and state["pages"][0]["version"] != old_version
+    assert state["has_pending_changes"]
     assert all(storage.path(path).is_file() for path in old_paths)
+    assert client.get("/api/participant/pdf", headers=auth(participant)).content == committed_pdf
+    lose_acknowledgement["next"] = True
+    uncertain_resubmission = client.post("/api/participant/submit", headers=auth(participant))
+    assert uncertain_resubmission.status_code == 503
+    assert uncertain_resubmission.json()["detail"]["code"] == "commit_uncertain"
+    assert not client.get("/api/participant", headers=auth(participant)).json()["has_pending_changes"]
     updated_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
     updated_preview = client.get(state["pages"][0]["preview_url"], headers=auth(participant)).content
     assert_pdf_photo_matches_preview(updated_pdf, 0, updated_preview)

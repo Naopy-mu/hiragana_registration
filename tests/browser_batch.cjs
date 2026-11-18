@@ -39,6 +39,13 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
         }
       };
       if (mode === 'native-camera') Object.defineProperty(navigator.mediaDevices, 'getUserMedia', { value: undefined });
+      if (mode === 'upload-timeout') {
+        const fetch = window.fetch.bind(window), timeout = window.setTimeout.bind(window);
+        window.setTimeout = (callback, delay, ...args) => timeout(callback, delay === 120000 ? 50 : delay, ...args);
+        window.fetch = (url, options) => url === '/api/participant/pages'
+          ? new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new DOMException('Network timed out', 'AbortError')), { once: true }))
+          : fetch(url, options);
+      }
     }, mode);
     const page = await context.newPage();
     page.setDefaultTimeout(15000);
@@ -54,21 +61,39 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
     }));
     const files = images.map((data, index) => ({ name: `page-${index + 1}.jpg`, mimeType: 'image/jpeg', buffer: Buffer.from(data, 'base64') }));
     const saved = new Map(), requests = [], attempts = new Map();
-    let active = 0, maxActive = 0, expiredOnce = false;
+    let active = 0, maxActive = 0, expiredOnce = false, previewReleased = false, releasePreview;
     const photo = (number, version = 'v1') => ({ page_number: number, qr_code: `TEST-0${number}`, version, preview_url: `/api/participant/pages/TEST-0${number}/preview` });
     if (mode.startsWith('duplicate') || mode.startsWith('submitted-gallery')) saved.set(1, photo(1));
     if (mode === 'submit-blocked') for (let i = 1; i <= 3; i++) saved.set(i, photo(i));
-    const participant = () => ({ participant_id: 'PTEST', status: mode.startsWith('submitted-') ? 'submitted' : 'registered', config, pages: [...saved.values()],
+    const submitted = mode.startsWith('submitted-'), pending = new Set();
+    let submittedNumbers = new Set(saved.keys()), submittedAt = '2026-11-19T00:00:00+00:00';
+    const participant = () => ({ participant_id: 'PTEST', status: submitted ? 'submitted' : 'registered', config, pages: [...saved.values()],
+      has_pending_changes: pending.size > 0, pending_page_count: pending.size,
       missing_pages: config.pages.filter(item => !saved.has(item.page_number)).map(item => item.qr_code),
-      worksheet: { available: true, title: '検証用紙', is_test: true, filename: 'test.pdf' } });
+      worksheet: { available: true, title: '検証用紙', is_test: true, filename: 'test.pdf' },
+      worksheet_submissions: [{ id: 'mock-worksheet', number: 1, number_label: '①', title: '検証用紙', page_count: 3,
+        status: submitted ? 'submitted' : 'registered', registered_pages: saved.size, missing_page_count: 3 - saved.size,
+        blank_pages: submitted ? 3 - submittedNumbers.size : 0,
+        blank_qr_codes: submitted ? config.pages.filter(item => !submittedNumbers.has(item.page_number)).map(item => item.qr_code) : [],
+        has_pending_changes: pending.size > 0, pending_page_count: pending.size,
+        pending_qr_codes: [...pending].map(number => `TEST-0${number}`), submitted_at: submitted ? submittedAt : null,
+        submit_url: '/api/participant/submit', pdf_url: submitted ? '/api/participant/pdf' : null,
+      }] });
     await context.route('**/api/**', async route => {
       const request = route.request(), pathname = new URL(request.url()).pathname;
       if (pathname === '/api/config') return route.fulfill({ json: config });
       if (pathname === '/api/participant') return route.fulfill({ json: participant() });
       if (pathname === '/api/register') return route.fulfill({ json: { participant_id: 'PNEW', resume_token: 'new-batch-token-' + 'x'.repeat(32) } });
-      if (pathname.endsWith('/preview')) return mode === 'preview-error'
-        ? route.fulfill({ status: 503, json: { detail: { message: 'プレビュー取得失敗' } } })
-        : route.fulfill({ contentType: 'image/jpeg', body: files[0].buffer });
+      if (pathname.endsWith('/preview')) {
+        if (mode === 'slow-preview' && !previewReleased) await new Promise(resolve => { releasePreview = resolve; });
+        return mode === 'preview-error'
+          ? route.fulfill({ status: 503, json: { detail: { message: 'プレビュー取得失敗' } } })
+          : route.fulfill({ contentType: 'image/jpeg', body: files[0].buffer });
+      }
+      if (pathname === '/api/participant/submit') {
+        pending.clear(); submittedNumbers = new Set(saved.keys()); submittedAt = '2026-11-19T01:00:00+00:00';
+        return route.fulfill({ json: { participant_id: 'PTEST', status: 'submitted', pdf_url: '/api/participant/pdf' } });
+      }
       if (pathname === '/api/participant/pages') {
         const body = request.postDataBuffer().toString('latin1');
         const name = body.match(/filename="([^"]+)"/)[1];
@@ -83,13 +108,15 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
         if (saved.has(number) && !replace) return route.fulfill({ status: 409, json: { detail: { code: 'duplicate_page', page_number: number, qr_code: `TEST-0${number}`, version: 'v1' } } });
         if (replace) assert.ok(/name="expected_version"\r\n\r\nv1/.test(body));
         const entry = photo(number, replace ? 'v2' : 'v1'); saved.set(number, entry);
+        if (submitted) pending.add(number);
         return route.fulfill({ json: { page: entry, participant: participant() } });
       }
       throw new Error('Unexpected API request: ' + pathname);
     });
     try {
       await page.goto(base); await page.locator('#participant-view').waitFor({ state: 'visible' });
-      await run({ page, files, requests, saved, getMaxActive: () => maxActive });
+      await run({ page, files, requests, saved, pending, getMaxActive: () => maxActive,
+        finishPreview: () => { previewReleased = true; releasePreview?.(); } });
       cases.push(mode);
     } finally { await context.close(); }
   }
@@ -195,7 +222,7 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
       assert.equal(requests.some(item => item.replace), accept);
       assert.equal(await page.locator('#queue-list [data-status="skipped"]').count(), accept ? 0 : 1);
     });
-    for (const accept of [false, true]) await scenario(accept ? 'submitted-gallery-accept' : 'submitted-gallery-cancel', async ({ page, files, requests, saved }) => {
+    for (const accept of [false, true]) await scenario(accept ? 'submitted-gallery-accept' : 'submitted-gallery-cancel', async ({ page, files, requests, saved, pending }) => {
       assert.equal(await page.locator('#submitted-panel').isVisible(), true);
       assert.equal(await page.locator('#upload-section').isVisible(), true);
       assert.equal(await page.locator('#gallery-button').isEnabled(), true);
@@ -208,13 +235,21 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
       assert.equal(saved.get(1).version, accept ? 'v2' : 'v1');
       assert.equal(await page.locator('#queue-list [data-status="saved"]').count(), accept ? 2 : 1);
       assert.equal(await page.locator('#queue-list [data-status="skipped"]').count(), accept ? 0 : 1);
-      assert.equal(await page.locator('#latest-preview').isVisible(), true);
+      await page.locator('#latest-preview').waitFor({ state: 'visible' });
       await page.locator('#preview-open').click(); await page.locator('#preview-dialog').waitFor({ state: 'visible' });
       await page.locator('#close-preview').click();
       assert.equal(await page.locator('#camera-button').isEnabled(), true);
       await page.reload(); await page.locator('#submitted-panel').waitFor({ state: 'visible' });
       assert.equal(await page.locator('#camera-button').isEnabled(), true);
       assert.equal(await page.locator('#page-list .complete').count(), 2);
+      assert.equal(await page.locator('#submit-button').isEnabled(), true);
+      assert.match(await page.locator('#submit-button').textContent(), /追加分を提出する/);
+      assert.equal(pending.size, accept ? 2 : 1);
+      assert.equal(await page.locator('#page-count').textContent(), '3 / 3');
+      assert.equal(await page.locator('.progress-track').getAttribute('aria-valuenow'), '100');
+      await page.locator('#submit-button').click(); await page.locator('#confirm-accept').click();
+      await page.locator('#submit-button').waitFor({ state: 'hidden' });
+      assert.equal(pending.size, 0);
     });
     await scenario('submitted-camera', async ({ page, requests }) => {
       await page.locator('#camera-button').click(); await page.locator('#camera-shutter:not([disabled])').waitFor();
@@ -225,14 +260,33 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
       assert.equal(requests.length, 2);
       assert.equal(await page.locator('#queue-list [data-status="saved"]').count(), 2);
       assert.equal(await page.locator('#submitted-panel').isVisible(), true);
-      assert.equal(await page.locator('#latest-preview').isVisible(), true);
+      await page.locator('#latest-preview').waitFor({ state: 'visible' });
       assert.equal(await page.locator('#camera-button').isEnabled(), true);
+      assert.equal(await page.locator('#submit-button').isEnabled(), true);
     });
     await scenario('preview-error', async ({ page, files, requests }) => {
       await page.locator('#gallery-input').setInputFiles(files); await page.locator('#capture-next-register').click(); await batchDone(page);
       assert.equal(await page.locator('#queue-list [data-status="saved"]').count(), 3);
       assert.equal(await page.locator('#batch-register').isDisabled(), true);
-      assert.match(await page.locator('#upload-error').textContent(), /登録は完了/); assert.equal(requests.length, 3);
+      await page.waitForFunction(() => document.getElementById('upload-error').textContent.includes('登録は完了'));
+      assert.equal(requests.length, 3);
+    });
+    await scenario('slow-preview', async ({ page, files, finishPreview }) => {
+      await page.locator('#gallery-input').setInputFiles(files.slice(0, 1)); await page.locator('#capture-next-register').click();
+      await batchDone(page);
+      assert.equal(await page.locator('#camera-button').isEnabled(), true, 'Preview retrieval must not keep registration locked');
+      assert.equal(await page.locator('#submit-button').isEnabled(), true);
+      await page.locator('#submit-button').click(); await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+      await page.locator('#confirm-cancel').click();
+      finishPreview(); await page.locator('#latest-preview').waitFor({ state: 'visible' });
+    });
+    await scenario('upload-timeout', async ({ page, files }) => {
+      await page.locator('#gallery-input').setInputFiles(files.slice(0, 1)); await page.locator('#capture-next-register').click();
+      await batchDone(page);
+      assert.equal(await page.locator('#queue-list [data-status="failed"]').count(), 1);
+      assert.match(await page.locator('#queue-list [data-status="failed"]').textContent(), /待ち時間を超えました/);
+      assert.equal(await page.locator('#camera-button').isEnabled(), true);
+      assert.equal(await page.locator('#batch-register').isEnabled(), true, 'A timed out upload must remain retryable');
     });
     await scenario('remove', async ({ page, files, requests }) => {
       await page.locator('#gallery-input').setInputFiles(files.slice(0, 2)); await review(page);
