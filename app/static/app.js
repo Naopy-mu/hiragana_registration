@@ -351,8 +351,14 @@
       const yes = await confirmAction(title, description, resubmitting ? "追加分を提出する" : "未記入を含めて提出する");
       if (!yes) return;
       ++state.previewRequest;
+      const submittedVersions = new Map(state.participant.pages.map(page => [page.qr_code, page.version]));
+      const targetIds = new Set((file ? [file] : state.participant.worksheet_submissions || []).map(item => item.id));
       await api(file ? file.submit_url : "/api/participant/submit", { method: "POST", participant: true, timeoutMs: 300000 });
       await loadParticipant(); $("latest-preview").hidden = true;
+      const targets = (state.participant.worksheet_submissions || []).filter(item => targetIds.has(item.id));
+      const stillPending = targetIds.size !== targets.length || targets.some(item => item.status !== "submitted" || [...item.pending_qr_codes || [], ...item.blank_qr_codes || []].some(code =>
+        submittedVersions.has(code) && state.participant.pages.some(page => page.qr_code === code && page.version === submittedVersions.get(code))));
+      if (stillPending || (!file && state.participant.status !== "submitted")) throw new Error("登録した写真が提出PDFに反映されていません。もう一度提出してください。");
       if (state.participant.status === "submitted" && !state.participant.has_pending_changes) camera.stop();
       message("app-error", ""); announce(resubmitting ? "追加分の提出が完了し、以前の提出PDFを更新しました。" : file ? `${file.number_label}の提出が完了しました。他の未提出の用紙は引き続き登録できます。` : "提出が完了しました。ご協力ありがとうございます。");
       if (file) $("worksheet-submissions").scrollIntoView({ block: "start", behavior: "smooth" });

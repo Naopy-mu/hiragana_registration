@@ -316,6 +316,9 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 if existing and expected_version and existing.version != expected_version:
                     fail(409, 'version_conflict', '別の操作で画像が変更されました。一覧を更新して確認してください。')
                 metrics = dict(processed.metrics)
+                # Registration stages a new photo version; only submission may
+                # acknowledge it, independently of clocks on separate workers.
+                metrics['submitted_version'] = None
                 configured = next(page for page in study_manifest['pages'] if page['qr_code'] == processed.qr_code)
                 file_id = configured.get('worksheet_id', current.worksheet_revision_id)
                 if current.status == 'submitted' and s.get(WorksheetSubmission, (current.submission_id, file_id)) is None:
@@ -383,6 +386,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 fully_submitted = current.status == 'submitted'
                 changed = False
                 pdf_data = {}
+                submitted_pages = []
                 for group in groups:
                     if worksheet_id is not None and group['id'] != worksheet_id:
                         continue
@@ -390,7 +394,8 @@ def create_app(settings: Settings | None = None, storage_override=None):
                     was_submitted = row is not None or fully_submitted
                     codes = {page['qr_code'] for page in group['pages']}
                     group_pages = [page for page in pages if page.qr_code in codes]
-                    updates = pending_pages(group_pages, row.submitted_at if row else current.submitted_at) if was_submitted else group_pages
+                    updates = pending_pages(group_pages, row.submitted_at if row else current.submitted_at,
+                                            json.loads(row.blank_qrs_json) if row else ()) if was_submitted else group_pages
                     if was_submitted and not updates:
                         continue
                     previous = None
@@ -413,6 +418,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
                     row.pdf_path = key
                     row.blank_qrs_json = json.dumps([page['qr_code'] for page in group['pages'] if page['qr_code'] not in present])
                     row.submitted_at = now()
+                    submitted_pages.extend(group_pages)
                     pdf_data[group['id']] = data
                     changed = True
                 # Freeze untouched legacy worksheets before replacing their combined PDF.
@@ -456,6 +462,12 @@ def create_app(settings: Settings | None = None, storage_override=None):
                             storage.put(key, output.getvalue(), 'application/pdf')
                             current.pdf_path = key
                         current.status = 'submitted'
+                    # Legacy PDF positions still depend on the previous photo
+                    # state. Acknowledge versions only after every PDF is built.
+                    for page in submitted_pages:
+                        metrics = json.loads(page.metrics_json)
+                        metrics['submitted_version'] = page.version
+                        page.metrics_json = json.dumps(metrics)
         except CommitUncertain:
             log.warning('Submission commit uncertain; retain PDF and retry submission safely.')
             fail(503, 'commit_uncertain', '提出状況を確認できませんでした。「提出する」で安全に再試行できます。')

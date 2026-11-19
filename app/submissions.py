@@ -26,12 +26,24 @@ def submission_rows(session, participant):
         select(WorksheetSubmission).where(WorksheetSubmission.submission_id == participant.submission_id))}
 
 
-def pending_pages(pages, submitted_at):
+def pending_pages(pages, submitted_at, blank_qrs=()):
     if submitted_at is None:
         return list(pages)
     cutoff = submitted_at.replace(tzinfo=timezone.utc) if submitted_at.tzinfo is None else submitted_at
-    return [page for page in pages
-            if (page.created_at.replace(tzinfo=timezone.utc) if page.created_at.tzinfo is None else page.created_at) > cutoff]
+    pending = []
+    blank = set(blank_qrs)
+    for page in pages:
+        metrics = json.loads(page.metrics_json)
+        if 'submitted_version' in metrics:
+            changed = metrics['submitted_version'] != page.version
+        else:
+            # Older records have no version receipt. A photo for a submitted
+            # template is pending even when its timestamp equals the cutoff.
+            created_at = page.created_at.replace(tzinfo=timezone.utc) if page.created_at.tzinfo is None else page.created_at
+            changed = page.qr_code in blank or created_at > cutoff
+        if changed:
+            pending.append(page)
+    return pending
 
 
 def worksheet_states(session, participant, pages, registry):
@@ -45,7 +57,7 @@ def worksheet_states(session, participant, pages, registry):
         codes = {page['qr_code'] for page in group['pages']}
         group_pages = [page for page in pages if page.qr_code in codes]
         submitted_at = row.submitted_at if row else participant.submitted_at if submitted else None
-        pending = pending_pages(group_pages, submitted_at) if submitted else []
+        pending = pending_pages(group_pages, submitted_at, json.loads(row.blank_qrs_json) if row else ()) if submitted else []
         pending_codes = {page.qr_code for page in pending}
         if row:
             blank = json.loads(row.blank_qrs_json)

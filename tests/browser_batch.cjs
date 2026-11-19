@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require('../.browser-tools/node_modules/playwright');
 
-const base = 'http://127.0.0.1:8001';
+const base = process.env.BROWSER_BASE_URL || 'http://127.0.0.1:8001';
+assert.ok(['127.0.0.1', 'localhost'].includes(new URL(base).hostname));
 const output = path.resolve(__dirname, '../artifacts/batch-browser');
 fs.mkdirSync(output, { recursive: true });
 const config = { title: '一括登録の動作確認', consent_version: 'batch-test', consent_text: '検証用', max_upload_mb: 25,
@@ -91,7 +92,10 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
           : route.fulfill({ contentType: 'image/jpeg', body: files[0].buffer });
       }
       if (pathname === '/api/participant/submit') {
-        pending.clear(); submittedNumbers = new Set(saved.keys()); submittedAt = '2026-11-19T01:00:00+00:00';
+        if (mode === 'submitted-noop-blank') pending.clear();
+        if (!mode.startsWith('submitted-noop')) {
+          pending.clear(); submittedNumbers = new Set(saved.keys()); submittedAt = '2026-11-19T01:00:00+00:00';
+        }
         return route.fulfill({ json: { participant_id: 'PTEST', status: 'submitted', pdf_url: '/api/participant/pdf' } });
       }
       if (pathname === '/api/participant/pages') {
@@ -250,6 +254,23 @@ const config = { title: '一括登録の動作確認', consent_version: 'batch-t
       await page.locator('#submit-button').click(); await page.locator('#confirm-accept').click();
       await page.locator('#submit-button').waitFor({ state: 'hidden' });
       assert.equal(pending.size, 0);
+    });
+    for (const mode of ['submitted-noop', 'submitted-noop-blank']) await scenario(mode, async ({ page, files, pending }) => {
+      await page.locator('#gallery-input').setInputFiles(files.slice(0, 1));
+      await page.locator('#capture-next-register').click(); await batchDone(page);
+      assert.equal(pending.size, 1);
+      assert.equal(await page.locator('#submit-button').isEnabled(), true);
+      await page.locator('#submit-button').click(); await page.locator('#confirm-accept').click();
+      await page.locator('#app-error').waitFor({ state: 'visible' });
+      assert.match(await page.locator('#app-error').textContent(), /登録した写真が提出PDFに反映されていません。もう一度提出してください。/);
+      if (mode === 'submitted-noop') {
+        await page.locator('#submit-button:not([disabled])').waitFor({ state: 'visible' });
+        assert.equal(pending.size, 1, 'A successful HTTP response must not hide a photo that remains unsubmitted');
+        assert.match(await page.locator('#submit-button').textContent(), /追加分を提出する/);
+      } else {
+        assert.equal(pending.size, 0, 'A cleared pending list must not hide a registered photo still marked as an unfilled template');
+      }
+      assert.doesNotMatch(await page.locator('#app-status').textContent(), /提出が完了|以前の提出PDFを更新/);
     });
     await scenario('submitted-camera', async ({ page, requests }) => {
       await page.locator('#camera-button').click(); await page.locator('#camera-shutter:not([disabled])').waitFor();

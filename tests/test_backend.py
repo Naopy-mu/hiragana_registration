@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from zipfile import ZipFile
 
 import pytest
@@ -381,6 +383,99 @@ def test_draft_registration_skips_pdf_work_and_resubmission_reuses_previous_page
     assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
     assert reads == [], "Retrying without new changes must not rebuild a PDF"
     assert client.get("/api/participant/pdf", headers=auth(participant)).content == updated_pdf
+
+
+@pytest.mark.parametrize("photo_offset,legacy", [
+    (timedelta(0), False), (timedelta(days=1), False), (timedelta(0), True),
+], ids=["same-time", "photo-time-ahead", "legacy-same-time"])
+def test_additional_submission_uses_photo_version_when_timestamps_overlap(harness, photos, monkeypatch, photo_offset, legacy, tmp_path, password_hash):
+    client, app, storage = harness
+    participant = register(client)
+    initial_time = datetime(2026, 11, 19, tzinfo=timezone.utc)
+    clock = initial_time
+    monkeypatch.setattr("app.main.now", lambda: clock)
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    previous_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+
+    clock = initial_time + photo_offset
+    added = upload(client, participant, photos[1])
+    assert added.status_code == 200, added.text
+    with app.state.db.read() as session:
+        page = session.scalar(select(Page))
+        assert json.loads(page.metrics_json)["submitted_version"] is None
+    if legacy:
+        with app.state.db.write() as session:
+            page = session.scalar(select(Page))
+            metrics = json.loads(page.metrics_json)
+            del metrics["submitted_version"]
+            page.metrics_json = json.dumps(metrics)
+    staged = client.get("/api/participant", headers=auth(participant)).json()
+    assert staged["has_pending_changes"] and staged["pending_page_count"] == 1
+    assert staged["worksheet_submissions"][0]["pending_qr_codes"] == ["HIRA1-01"]
+    assert client.get("/api/participant/pdf", headers=auth(participant)).content == previous_pdf
+    # Submission may complete before the photo's wall-clock timestamp.
+    clock = initial_time + timedelta(seconds=1)
+    submitted = client.post("/api/participant/submit", headers=auth(participant))
+    assert submitted.status_code == 200, submitted.text
+    completed = client.get("/api/participant", headers=auth(participant)).json()
+    assert not completed["has_pending_changes"] and completed["pending_page_count"] == 0
+    assert completed["worksheet_submissions"][0]["pending_qr_codes"] == []
+    assert completed["blank_page_count"] == 2
+    updated_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+    assert updated_pdf != previous_pdf
+    preview = client.get(completed["pages"][0]["preview_url"], headers=auth(participant)).content
+    assert_pdf_photo_matches_preview(updated_pdf, 0, preview)
+    with app.state.db.read() as session:
+        page = session.scalar(select(Page))
+        assert json.loads(page.metrics_json)["submitted_version"] == page.version
+        committed_path = session.scalar(select(Participant.pdf_path))
+
+    # Reopening the application and retrying must preserve the accepted PDF.
+    settings = Settings(data_dir=tmp_path, session_secret="integration-session-secret-" + "x" * 40,
+                        researcher_password_hash=password_hash)
+    with TestClient(create_app(settings, storage_override=storage)) as reopened:
+        refreshed = reopened.get("/api/participant", headers=auth(participant)).json()
+        assert not refreshed["has_pending_changes"]
+        assert reopened.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+        assert reopened.get("/api/participant/pdf", headers=auth(participant)).content == updated_pdf
+    with app.state.db.read() as session:
+        assert session.scalar(select(Participant.pdf_path)) == committed_path
+
+
+def test_failed_submission_rolls_back_photo_version_receipt(harness, photos, monkeypatch):
+    client, app, _ = harness
+    participant = register(client)
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    previous_pdf = client.get("/api/participant/pdf", headers=auth(participant)).content
+    added = upload(client, participant, photos[1])
+    assert added.status_code == 200, added.text
+    staged = client.get("/api/participant", headers=auth(participant)).json()
+    session_class = app.state.db.sessions.class_
+    original_commit = session_class.commit
+    flushed_receipts = []
+
+    def fail_after_flushing_receipt(session):
+        session.flush()
+        page = session.scalar(select(Page))
+        assert json.loads(page.metrics_json)["submitted_version"] == page.version
+        flushed_receipts.append(page.version)
+        raise OSError("Submission transaction failed before committing its photo receipt")
+
+    monkeypatch.setattr(session_class, "commit", fail_after_flushing_receipt)
+    failed = client.post("/api/participant/submit", headers=auth(participant))
+    assert failed.status_code == 503
+    assert flushed_receipts == [added.json()["page"]["version"]]
+    assert client.get("/api/participant", headers=auth(participant)).json() == staged
+    assert client.get("/api/participant/pdf", headers=auth(participant)).content == previous_pdf
+    with app.state.db.read() as session:
+        assert json.loads(session.scalar(select(Page)).metrics_json)["submitted_version"] is None
+
+    monkeypatch.setattr(session_class, "commit", original_commit)
+    assert client.post("/api/participant/submit", headers=auth(participant)).status_code == 200
+    assert not client.get("/api/participant", headers=auth(participant)).json()["has_pending_changes"]
+    with app.state.db.read() as session:
+        page = session.scalar(select(Page))
+        assert json.loads(page.metrics_json)["submitted_version"] == page.version
 
 
 def test_pdf_download_recovers_when_replacement_removes_authenticated_pdf(harness, photos, replacement_photo, monkeypatch):
