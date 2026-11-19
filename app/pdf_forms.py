@@ -10,6 +10,7 @@ import numpy as np
 import zxingcpp
 
 from app.imaging import ImageValidationError, _decode_qr, _marker_candidates
+from app.pdf_engine import pdf_operation
 
 
 MAX_PDF_PAGES = 500
@@ -101,6 +102,7 @@ def _page_marks(page, gray, qr, page_number):
     return vector_mm
 
 
+@pdf_operation
 def analyze_pdf(data: bytes) -> dict:
     if len(data) > 25 * 1024 * 1024:
         raise PdfFormError('pdf_too_large', '用紙PDFは25MB以内にしてください。')

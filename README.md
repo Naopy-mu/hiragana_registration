@@ -125,6 +125,14 @@ Supabaseの[接続方法](https://supabase.com/docs/guides/database/connecting-t
 
 提出待ちは、写真の現在の版と最後に提出した版を比較して判定します。登録日時と提出日時が同じ場合や、サーバー間で時計に差がある場合も、追加写真を提出PDFへ反映できます。版の記録はPDFの保存と同じトランザクションで確定し、既存データは日時と未記入QR一覧で判定します。DB列の追加は不要です。画面でも提出後の状態を確認し、同じ写真が未提出・未記入のまま残る場合は再試行を案内します。
 
+128ページなど大きい用紙の提出では、PyMuPDFで未変更ページをそのままコピーし、追加写真だけを可逆圧縮で埋め込みます。写真の画素は維持します。Supabaseからの写真取得は最大4件ずつ進め、提出確定後の旧ファイル削除は応答後に行います。処理中・確認中・失敗は、押した提出ボタンの直下へ表示します。
+
+Supabaseの提出PDFが16MiBを超える場合は、最大6MiBの非公開断片と索引で保存します。全断片の保存後に索引を公開し、取得時は各断片と全体のSHA-256を確認して元のPDFへ復元します。参加者・研究者は従来どおり1つのPDFを取得できます。配布原本PDFと小さい提出PDFの保存形式は維持します。[Supabaseの1ファイル上限](https://supabase.com/docs/guides/storage/uploads/file-limits)を超える提出PDFにも対応する方式で、バケットを公開する必要はありません。新しい分割形式の保存後は、読み取り機能を含まない旧版へ戻せません。更新時は旧workerを終了してから新バージョンを利用してください。
+
+128ページなど大きい用紙の提出では、PyMuPDFで未変更ページをそのままコピーし、追加写真だけを可逆圧縮で埋め込みます。写真の画素は維持します。Supabaseからの写真取得は最大4件ずつ進め、提出確定後の旧ファイル削除は応答後に行います。処理中・確認中・失敗は、押した提出ボタンの直下へ表示します。
+
+Supabaseの提出PDFが16MiBを超える場合は、最大6MiBの非公開断片と索引で保存します。全断片の保存後に索引を公開し、取得時は各断片と全体のSHA-256を確認して元のPDFへ復元します。参加者・研究者は従来どおり1つのPDFを取得できます。配布原本PDFと小さい提出PDFの保存形式は維持します。[Supabaseの1ファイル上限](https://supabase.com/docs/guides/storage/uploads/file-limits)を超える提出PDFにも対応する方式で、バケットを公開する必要はありません。新しい分割形式の保存後は、読み取り機能を含まない旧版へ戻せません。更新時は旧workerを終了してから新バージョンを利用してください。
+
 ## テスト
 
 ```powershell
@@ -148,6 +156,10 @@ node tests/browser_library.cjs
 写真の一括登録・模擬カメラ・期限切れからの復帰は、ローカルの検証用サーバー（`http://127.0.0.1:8001`）を起動してから、`node tests/browser_batch.cjs`・`node tests/browser_camera.cjs`・`node tests/browser_expiry.cjs`で確認できます。これらはAPIとカメラを模擬し、実際の参加者データを作成しません。サーバーの起動設定は[検証記録](docs/VERIFICATION.md)を参照してください。
 
 個別提出の実ブラウザ検証は、同じ検証専用サーバーを使って`$env:BROWSER_BASE_URL='http://127.0.0.1:8002'; node tests/browser_submissions.cjs`で実行できます。検証用の複数PDFを登録するため、本番URLでは実行できません。`python scripts/verify_individual_submissions_postgres.py`は、`.env`の接続先の検証専用スキーマを作成して同時提出と005を確認し、終了時にそのスキーマだけを削除します。
+
+128ページ・写真14枚を提出した後に15枚を追加する負荷検証は、`python scripts/benchmark_submission_pdf.py --output artifacts/submission-pdf-final.json`で実行できます。合成写真と一時Storageだけを使い、DB・`.env`・本番には接続しません。写真の画素、ページ順、目次、未変更ページの描画と、追加写真だけを取得することも確認します。`BROWSER_BASE_URL`を検証専用サーバーへ設定して`node tests/browser_submission_feedback.cjs`を実行すると、128ページの提出中表示・失敗・再試行をAPIモックで確認できます。
+
+128ページ・写真14枚を提出した後に15枚を追加する負荷検証は、`python scripts/benchmark_submission_pdf.py --output artifacts/submission-pdf-final.json`で実行できます。合成写真と一時Storageだけを使い、DB・`.env`・本番には接続しません。写真の画素、ページ順、目次、未変更ページの描画と、追加写真だけを取得することも確認します。`BROWSER_BASE_URL`を検証専用サーバーへ設定して`node tests/browser_submission_feedback.cjs`を実行すると、128ページの提出中表示・失敗・再試行をAPIモックで確認できます。
 
 Supabaseの実接続とAzureへの初回公開は確認済みです。公開URLでのスマホ実機撮影・全8ページの提出・研究者回収の通し確認は、これから実施します。
 

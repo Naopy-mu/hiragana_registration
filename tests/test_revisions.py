@@ -641,6 +641,51 @@ def test_submitted_retake_updates_target_and_combined_but_keeps_other_pdf(revisi
         assert archive.read(f'{pid}/{pid}_02.pdf') == other_pdf
 
 
+def test_individual_pdf_download_recovers_when_resubmission_removes_old_pdf(revision_harness, separate_pdfs, form_photos, retaken_form_photo, monkeypatch):
+    from app.database import Participant, WorksheetSubmission
+    from sqlalchemy import select
+    client, _, auth, ids = partial_setup(revision_harness, separate_pdfs)
+    uploaded = client.post('/api/participant/pages', headers=auth,
+                           files={'file': ('first.jpg', form_photos[0], 'image/jpeg')})
+    assert uploaded.status_code == 200, uploaded.text
+    old_page = uploaded.json()['page']
+    submit_url = f'/api/participant/worksheets/{ids[0]}/submit'
+    result_url = f'/api/participant/worksheets/{ids[0]}/submission'
+    assert client.post(submit_url, headers=auth).status_code == 200
+    app, storage = revision_harness[1], revision_harness[3]
+    with app.state.db.read() as session:
+        participant = session.scalar(select(Participant))
+        submission_id = participant.submission_id
+        old_path = session.get(WorksheetSubmission, (submission_id, ids[0])).pdf_path
+    original_get, reads = storage.get, []
+    replaced = False
+
+    def replace_before_reading_old_pdf(key):
+        nonlocal replaced
+        reads.append(key)
+        if key == old_path and not replaced:
+            replaced = True
+            replacement = client.post('/api/participant/pages', headers=auth,
+                                      files={'file': ('retaken.jpg', retaken_form_photo, 'image/jpeg')},
+                                      data={'replace': 'true', 'expected_version': old_page['version']})
+            assert replacement.status_code == 200, replacement.text
+            assert client.post(submit_url, headers=auth).status_code == 200
+            assert not storage.path(old_path).exists()
+        return original_get(key)
+
+    monkeypatch.setattr(storage, 'get', replace_before_reading_old_pdf)
+    response = client.get(result_url, headers=auth)
+    assert response.status_code == 200, response.text
+    assert replaced
+    with app.state.db.read() as session:
+        latest_path = session.get(WorksheetSubmission, (submission_id, ids[0])).pdf_path
+    assert latest_path != old_path
+    assert old_path in reads and reads[-1] == latest_path
+    assert response.content == original_get(latest_path)
+    assert_submitted_photo(client, auth, response.content, 0, old_page)
+    assert_template_page(response.content, 1, separate_pdfs[1])
+
+
 def test_individual_resubmission_keeps_other_worksheet_draft_out_of_combined_pdf(revision_harness, separate_pdfs, form_photos):
     import csv
     from zipfile import ZipFile

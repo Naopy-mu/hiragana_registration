@@ -1,7 +1,7 @@
 "use strict";
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { config: null, participant: null, token: null, busy: false, collecting: false, worksheetBusy: false, csrf: null, participants: [], selected: new Set(), previewObjectUrl: null, previewRequest: 0, worksheetRevision: null, worksheetSelection: [], revisionBusy: false };
+  const state = { config: null, participant: null, token: null, busy: false, collecting: false, worksheetBusy: false, csrf: null, participants: [], selected: new Set(), previewObjectUrl: null, previewRequest: 0, worksheetRevision: null, worksheetSelection: [], revisionBusy: false, activeSubmission: null, submissionFeedback: new Map() };
   const storage = {
     get(store, key) { try { return window[store].getItem(key); } catch { return null; } },
     set(store, key, value) { try { window[store].setItem(key, value); } catch { /* Private browsing can disable storage. */ } },
@@ -62,6 +62,7 @@
   }
   function resetExpiredRegistration(text) {
     state.token = null; state.participant = null; state.registrationKey = null;
+    state.activeSubmission = null; state.submissionFeedback.clear();
     storage.remove("sessionStorage", "handwriting_resume_token");
     storage.remove("localStorage", "handwriting_registration_key");
     if (state.previewObjectUrl) { URL.revokeObjectURL(state.previewObjectUrl); state.previewObjectUrl = null; }
@@ -93,14 +94,49 @@
     photoQueue.setBusy(locked);
     $("upload-section").setAttribute("aria-busy", String(busy));
     $("submit-button").disabled = locked || (submitted && !state.participant?.has_pending_changes) || !state.participant || photoQueue.hasPending;
+    $("submit-button").textContent = state.activeSubmission === "all" ? submissionButtonLabel() : submitted && state.participant?.has_pending_changes ? "追加分を提出する →" : "提出する →";
     for (const button of document.querySelectorAll(".worksheet-submit")) button.disabled = locked || photoQueue.hasPending;
     for (const button of document.querySelectorAll(".worksheet-result-download")) button.disabled = busy || state.collecting;
     if (state.participant) $("submit-hint").textContent = photoQueue.hasPending ? "一覧の写真を先に登録するか、一覧から外してください。" : state.participant.has_pending_changes ? "登録した追加・撮り直し分は未提出です。「追加分を提出する」で以前のPDFに反映します。" : submitted ? "提出済みです。追加の写真は登録後に、あらためて提出してください。" : state.participant.worksheet_submissions?.length > 1 ? "PDFごとに提出できます。未登録ページは未記入テンプレートで補います。" : "未登録ページは未記入テンプレートで補って提出できます。";
+    renderSingleSubmissionFeedback();
+  }
+  function submissionButtonLabel() {
+    return state.submissionFeedback.get(state.activeSubmission)?.status === "checking" ? "提出内容を確認しています…" : "PDFを作成・保存しています…";
+  }
+  function fillSubmissionFeedback(element, feedback) {
+    element.hidden = !feedback;
+    element.textContent = feedback?.text || "";
+    element.classList.toggle("error", feedback?.status === "error");
+    element.dataset.state = feedback?.status || "";
+    element.setAttribute("role", feedback?.status === "error" ? "alert" : "status");
+  }
+  function renderSingleSubmissionFeedback() {
+    let element = $("submit-feedback");
+    if (!element) {
+      element = make("p", "notice submission-feedback"); element.id = "submit-feedback";
+      $("submit-button").after(element);
+    }
+    fillSubmissionFeedback(element, state.submissionFeedback.get("all"));
+  }
+  function setSubmissionFeedback(key, status, text) {
+    if (!state.participant) return;
+    state.submissionFeedback.set(key, { status, text });
+    state.activeSubmission = status === "saving" || status === "checking" ? key : null;
+    if (state.participant) renderWorksheetSubmissions(state.participant);
+    setParticipantBusy(state.busy);
+  }
+  function scrollToSubmissionFeedback(key) {
+    const element = key === "all" ? $("submit-feedback") : document.querySelector(`[data-worksheet-id="${CSS.escape(key)}"] .submission-feedback`);
+    element?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
   function resumeUrl() { return `${location.origin}/#${state.token}`; }
   function renderParticipant(participant) {
     const wasSubmitted = state.participant?.status === "submitted";
     state.participant = participant;
+    if (participant.has_pending_changes && state.submissionFeedback.get("all")?.status === "success") state.submissionFeedback.delete("all");
+    for (const file of participant.worksheet_submissions || []) {
+      if (file.has_pending_changes && state.submissionFeedback.get(file.id)?.status === "success") state.submissionFeedback.delete(file.id);
+    }
     if (participant.config) state.config = { ...state.config, ...participant.config };
     $("profile-banner").hidden = state.config.production_ready === true;
     showView("participant");
@@ -144,7 +180,7 @@
     renderWorksheetSubmissions(participant);
     setParticipantBusy(state.busy);
   }
-  async function loadParticipant() { renderParticipant(await api("/api/participant", { participant: true })); }
+  async function loadParticipant(timeoutMs = 60000) { renderParticipant(await api("/api/participant", { participant: true, timeoutMs })); }
   function numbered(number) {
     return number <= 20 ? String.fromCodePoint(0x2460 + number - 1) : number <= 35 ? String.fromCodePoint(0x3251 + number - 21) : number <= 50 ? String.fromCodePoint(0x32b1 + number - 36) : `(${number})`;
   }
@@ -169,10 +205,12 @@
     const list = $("worksheet-submission-list"); list.replaceChildren();
     for (const file of files) {
       const row = make("div", "worksheet-submission-row"); row.dataset.worksheetId = file.id; row.dataset.status = file.status;
+      const submitting = state.activeSubmission === file.id || state.activeSubmission === "all";
+      row.setAttribute("aria-busy", String(submitting));
       const done = file.status === "submitted";
       row.append(make("h3", "", `${file.number_label} ${file.original_name || file.title}`));
       row.append(make("p", "small muted", done ? `提出済み · 写真${file.page_count - file.blank_pages}ページ／未記入${file.blank_pages}ページ${file.has_pending_changes ? `。追加・撮り直しの${file.pending_page_count}ページは未提出です。` : ""}` : `全${file.page_count}ページ中、写真${file.registered_pages}ページを登録済み。未登録の${file.missing_page_count}ページは未記入テンプレートで補います。`));
-      const button = make("button", `button ${done ? "secondary worksheet-result-download" : "primary worksheet-submit"}`, done ? `${file.number_label}の提出PDFを確認` : `${file.number_label}を提出する`);
+      const button = make("button", `button ${done ? "secondary worksheet-result-download" : "primary worksheet-submit"}`, done ? `${file.number_label}の提出PDFを確認` : submitting ? submissionButtonLabel() : `${file.number_label}を提出する`);
       button.type = "button";
       button.addEventListener("click", done ? async () => {
         if (state.busy || state.collecting) return;
@@ -183,9 +221,12 @@
       } : () => submit(file));
       row.append(button);
       if (done && file.has_pending_changes) {
-        const resubmit = make("button", "button primary worksheet-submit", `${file.number_label}の追加分を提出する`);
+        const resubmit = make("button", "button primary worksheet-submit", submitting ? submissionButtonLabel() : `${file.number_label}の追加分を提出する`);
         resubmit.type = "button"; resubmit.addEventListener("click", () => submit(file)); row.append(resubmit);
       }
+      const feedback = make("p", "notice submission-feedback");
+      fillSubmissionFeedback(feedback, state.submissionFeedback.get(file.id));
+      row.append(feedback);
       list.append(row);
     }
   }
@@ -342,7 +383,8 @@
   async function submit(file = null) {
     if (state.busy || state.collecting || photoQueue.hasPending || !state.participant || (state.participant.status === "submitted" && !state.participant.has_pending_changes) || (file?.status === "submitted" && !file.has_pending_changes)) return;
     const resubmitting = file ? file.status === "submitted" : state.participant.status === "submitted";
-    setParticipantBusy(true); $("submit-button").textContent = "PDFを作成しています…"; message("app-error", "");
+    const feedbackKey = file?.id || "all";
+    setParticipantBusy(true); message("app-error", "");
     try {
       const missing = file ? file.missing_page_count : state.config.pages.length - state.participant.pages.length;
       const pending = file ? file.pending_page_count : state.participant.pending_page_count;
@@ -351,21 +393,30 @@
       const yes = await confirmAction(title, description, resubmitting ? "追加分を提出する" : "未記入を含めて提出する");
       if (!yes) return;
       ++state.previewRequest;
+      setSubmissionFeedback(feedbackKey, "saving", "PDFを作成・保存しています。完了するまで、この画面を開いたままお待ちください。");
       const submittedVersions = new Map(state.participant.pages.map(page => [page.qr_code, page.version]));
       const targetIds = new Set((file ? [file] : state.participant.worksheet_submissions || []).map(item => item.id));
       await api(file ? file.submit_url : "/api/participant/submit", { method: "POST", participant: true, timeoutMs: 300000 });
+      setSubmissionFeedback(feedbackKey, "checking", "提出内容を確認しています。もうしばらくお待ちください。");
       await loadParticipant(); $("latest-preview").hidden = true;
       const targets = (state.participant.worksheet_submissions || []).filter(item => targetIds.has(item.id));
       const stillPending = targetIds.size !== targets.length || targets.some(item => item.status !== "submitted" || [...item.pending_qr_codes || [], ...item.blank_qr_codes || []].some(code =>
         submittedVersions.has(code) && state.participant.pages.some(page => page.qr_code === code && page.version === submittedVersions.get(code))));
       if (stillPending || (!file && state.participant.status !== "submitted")) throw new Error("登録した写真が提出PDFに反映されていません。もう一度提出してください。");
       if (state.participant.status === "submitted" && !state.participant.has_pending_changes) camera.stop();
-      message("app-error", ""); announce(resubmitting ? "追加分の提出が完了し、以前の提出PDFを更新しました。" : file ? `${file.number_label}の提出が完了しました。他の未提出の用紙は引き続き登録できます。` : "提出が完了しました。ご協力ありがとうございます。");
+      const completed = resubmitting ? "追加分の提出が完了し、以前の提出PDFを更新しました。" : file ? `${file.number_label}の提出が完了しました。他の未提出の用紙は引き続き登録できます。` : "提出が完了しました。ご協力ありがとうございます。";
+      setSubmissionFeedback(feedbackKey, "success", completed);
+      message("app-error", ""); announce(completed);
       if (file) $("worksheet-submissions").scrollIntoView({ block: "start", behavior: "smooth" });
       else window.scrollTo({ top: 0, behavior: "smooth" });
     }
-    catch (error) { message("app-error", error.message + " 提出状況を確認して、再度お試しください。"); try { await loadParticipant(); } catch { /* The server may still be offline. */ } }
-    finally { setParticipantBusy(false); $("submit-button").textContent = state.participant?.status === "submitted" && state.participant.has_pending_changes ? "追加分を提出する →" : "提出する →"; }
+    catch (error) {
+      const text = error.message + " 提出状況を確認して、再度お試しください。";
+      message("app-error", text); setSubmissionFeedback(feedbackKey, "error", text);
+      try { await loadParticipant(15000); } catch { /* The server may still be offline. */ }
+      scrollToSubmissionFeedback(feedbackKey);
+    }
+    finally { setParticipantBusy(false); }
   }
   function renderResearchers() {
     $("researcher-content").hidden = false; $("login-panel").hidden = true; $("logout-button").hidden = false;

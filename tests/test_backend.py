@@ -478,6 +478,102 @@ def test_failed_submission_rolls_back_photo_version_receipt(harness, photos, mon
         assert json.loads(page.metrics_json)["submitted_version"] == page.version
 
 
+def test_submission_sends_response_before_old_pdf_cleanup(harness, photos, monkeypatch):
+    client, app, storage = harness
+    participant = register(client)
+    assert client.post('/api/participant/submit', headers=auth(participant)).status_code == 200
+    with app.state.db.read() as session:
+        old_pdf = session.scalar(select(Participant.pdf_path))
+    assert upload(client, participant, photos[1]).status_code == 200
+    events = []
+    original_delete = storage.delete
+
+    def delete_after_response(key):
+        events.append(('delete', key))
+        assert 'response' in events, 'Old-file deletion must not delay the submission response'
+        original_delete(key)
+
+    async def observe_response(scope, receive, send):
+        async def observed_send(message):
+            if message['type'] == 'http.response.body' and not message.get('more_body', False):
+                events.append('response')
+            await send(message)
+        await app(scope, receive, observed_send)
+
+    monkeypatch.setattr(storage, 'delete', delete_after_response)
+    with TestClient(observe_response) as observed:
+        response = observed.post('/api/participant/submit', headers=auth(participant))
+        assert response.status_code == 200, response.text
+    assert events.index('response') < events.index(('delete', old_pdf))
+    assert not storage.path(old_pdf).exists()
+    completed = client.get('/api/participant', headers=auth(participant)).json()
+    assert not completed['has_pending_changes']
+    pdf = client.get('/api/participant/pdf', headers=auth(participant)).content
+    preview = client.get(completed['pages'][0]['preview_url'], headers=auth(participant)).content
+    assert_pdf_photo_matches_preview(pdf, 0, preview)
+
+
+def test_additional_submission_roundtrips_chunked_private_pdf(tmp_path, password_hash, monkeypatch):
+    import httpx
+    import numpy as np
+    from PIL import Image
+    from types import SimpleNamespace
+    from app.storage import SupabaseStorage
+
+    monkeypatch.setattr('app.storage.PDF_PART_THRESHOLD', 16 * 1024)
+    monkeypatch.setattr('app.storage.PDF_PART_SIZE', 8 * 1024)
+    objects, uploads = {}, []
+
+    def private_storage(request):
+        if '/bucket/' in request.url.path:
+            return httpx.Response(200, json={'public': False})
+        if request.method == 'DELETE':
+            for key in json.loads(request.content)['prefixes']:
+                objects.pop(key, None)
+            return httpx.Response(200, json=[])
+        key = request.url.path.split('/object/handwriting-private/', 1)[1]
+        if request.method == 'POST':
+            content_type = request.headers['content-type']
+            if not content_type.startswith('image/') and not key.startswith('study-worksheets/'):
+                assert len(request.content) <= 16 * 1024, 'The service limits each stored object'
+            assert key not in objects
+            objects[key] = request.content
+            uploads.append(key)
+            return httpx.Response(200, json={'Key': key})
+        return httpx.Response(200, content=objects[key]) if key in objects else httpx.Response(404)
+
+    settings = Settings(data_dir=tmp_path, session_secret='chunked-integration-' + 'x' * 40,
+                        researcher_password_hash=password_hash, supabase_url='https://private.example',
+                        supabase_key='sb_secret_mock_only')
+    storage = SupabaseStorage(settings)
+    storage.client.close()
+    storage.client = httpx.Client(transport=httpx.MockTransport(private_storage), headers=storage.headers)
+    output = io.BytesIO()
+    Image.fromarray(np.random.default_rng(4).integers(0, 256, (360, 256), dtype=np.uint8)).save(output, format='PNG')
+    corrected = output.getvalue()
+    monkeypatch.setattr('app.imaging.process_image', lambda *_: SimpleNamespace(
+        qr_code='HIRA1-01', page_number=1, png_bytes=corrected, metrics={}))
+    with TestClient(create_app(settings, storage_override=storage)) as client:
+        participant = register(client)
+        assert client.post('/api/participant/submit', headers=auth(participant)).status_code == 200
+        previous_pdf = client.get('/api/participant/pdf', headers=auth(participant)).content
+        assert upload(client, participant, b'new-photo').status_code == 200
+        assert client.get('/api/participant/pdf', headers=auth(participant)).content == previous_pdf
+        response = client.post('/api/participant/submit', headers=auth(participant))
+        assert response.status_code == 200, response.text
+        state = client.get('/api/participant', headers=auth(participant)).json()
+        assert not state['has_pending_changes']
+        result = client.get('/api/participant/pdf', headers=auth(participant)).content
+        assert result.startswith(b'%PDF-') and result != previous_pdf
+        assert_pdf_photo_matches_preview(result, 0, corrected)
+        assert client.get(state['worksheet_submissions'][0]['pdf_url'], headers=auth(participant)).content == result
+        before_retry = list(uploads)
+        assert client.post('/api/participant/submit', headers=auth(participant)).status_code == 200
+        assert client.get('/api/participant/pdf', headers=auth(participant)).content == result
+        assert uploads == before_retry
+        assert any('.parts/' in key for key in objects), 'The PDF must actually use private parts'
+
+
 def test_pdf_download_recovers_when_replacement_removes_authenticated_pdf(harness, photos, replacement_photo, monkeypatch):
     client, app, storage = harness
     participant = register(client)

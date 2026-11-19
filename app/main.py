@@ -14,14 +14,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from pypdf import PdfReader, PdfWriter
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -33,6 +29,7 @@ from app.settings import ROOT, Settings
 from app.storage import LocalStorage, SupabaseStorage
 from app.worksheet import worksheet_info
 from app.submissions import legacy_worksheet_pdf, pending_pages, submission_rows, worksheet_groups, worksheet_pdf_name, worksheet_states
+from app.submission_pdf import combine_pdfs, make_pdf
 
 log = logging.getLogger('handwriting')
 
@@ -69,47 +66,6 @@ class Download(BaseModel):
     scope: Literal['submitted', 'selected']
     participant_ids: list[str] = Field(default_factory=list, max_length=1000)
     types: list[Literal['pdf', 'original', 'corrected', 'csv']] = Field(min_length=1, max_length=4)
-
-
-def make_pdf(participant, pages, storage, configured_pages, registry, previous_pdf=None, updated_qrs=None):
-    present = {page.qr_code: page for page in pages}
-    configured_pages = sorted(configured_pages, key=lambda item: item['page_number'])
-    previous = PdfReader(io.BytesIO(previous_pdf)) if previous_pdf is not None else None
-    if previous is not None and len(previous.pages) != len(configured_pages):
-        raise ValueError('Previous submission page count does not match the worksheet')
-    photos = io.BytesIO()
-    pdf = canvas.Canvas(photos, pagesize=A4, pageCompression=1)
-    photo_positions = {}
-    for configured in configured_pages:
-        code = configured['qr_code']
-        page = present.get(code)
-        if page is not None and (previous is None or updated_qrs is None or code in updated_qrs):
-            photo_positions[code] = len(photo_positions)
-            pdf.drawImage(ImageReader(io.BytesIO(storage.get(page.corrected_path))), 0, 0, width=A4[0], height=A4[1])
-            pdf.showPage()
-    pdf.save()
-    photo_pdf = PdfReader(photos) if photo_positions else None
-    templates = {}
-    writer = PdfWriter()
-    writer.add_metadata({'/Title': participant.participant_id})
-    for index, configured in enumerate(configured_pages):
-        code = configured['qr_code']
-        if code in photo_positions:
-            writer.add_page(photo_pdf.pages[photo_positions[code]])
-        elif previous is not None:
-            writer.add_page(previous.pages[index])
-        else:
-            # Use the participant's immutable source, including file-local page order.
-            worksheet_id = configured.get('worksheet_id', participant.worksheet_revision_id)
-            if worksheet_id not in templates:
-                data, _ = registry.pdf(worksheet_id)
-                templates[worksheet_id] = PdfReader(io.BytesIO(data))
-            source_page = configured.get('file_page_number', configured['page_number']) - 1
-            writer.add_page(templates[worksheet_id].pages[source_page])
-        writer.add_outline_item(f"{configured['page_number']}: {code}", index)
-    output = io.BytesIO()
-    writer.write(output)
-    return output.getvalue()
 
 
 def create_app(settings: Settings | None = None, storage_override=None):
@@ -370,7 +326,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
                 fail(404, 'page_missing', '画像が見つかりません。')
             return Response(storage.get(page.corrected_path), media_type='image/png')
 
-    def submit_files(participant, worksheet_id=None):
+    def submit_files(participant, background_tasks, worksheet_id=None):
         new_keys, old_keys = [], []
         try:
             with pdf_slots, db.write() as s:
@@ -445,21 +401,12 @@ def create_app(settings: Settings | None = None, storage_override=None):
                         if len(groups) == 1:
                             current.pdf_path = rows[groups[0]['id']].pdf_path
                         else:
-                            writer = PdfWriter()
-                            writer.add_metadata({'/Title': current.participant_id})
-                            position = 0
-                            for group in groups:
-                                data = pdf_data.get(group['id'])
-                                document = PdfReader(io.BytesIO(data if data is not None else storage.get(rows[group['id']].pdf_path)))
-                                for configured, pdf_page in zip(group['pages'], document.pages, strict=True):
-                                    writer.add_page(pdf_page)
-                                    writer.add_outline_item(f"{configured['page_number']}: {configured['qr_code']}", position)
-                                    position += 1
-                            output = io.BytesIO()
-                            writer.write(output)
+                            data = combine_pdfs(current.participant_id, (
+                                (group['pages'], pdf_data[group['id']] if group['id'] in pdf_data
+                                 else storage.get(rows[group['id']].pdf_path)) for group in groups))
                             key = f'{current.participant_id}/{current.submission_id}/{uuid.uuid4()}/{current.participant_id}.pdf'
                             new_keys.append(key)
-                            storage.put(key, output.getvalue(), 'application/pdf')
+                            storage.put(key, data, 'application/pdf')
                             current.pdf_path = key
                         current.status = 'submitted'
                     # Legacy PDF positions still depend on the previous photo
@@ -478,17 +425,19 @@ def create_app(settings: Settings | None = None, storage_override=None):
             clean(new_keys)
             log.exception('PDF submission failed')
             fail(503, 'submission_failed', 'PDFを保存できませんでした。以前の提出PDFと登録済み写真は保持されています。「提出する」で再試行できます。')
-        clean(set(old_keys) - set(new_keys))
+        # Old-object deletion is best effort and must not hold the success
+        # response after the new PDF and photo versions have been committed.
+        background_tasks.add_task(clean, set(old_keys) - set(new_keys))
         return {'participant_id': current.participant_id, 'status': current.status,
                 'pdf_url': '/api/participant/pdf' if current.status == 'submitted' else None}
 
     @app.post('/api/participant/submit')
-    def submit(participant=Depends(participant_auth)):
-        return submit_files(participant)
+    def submit(background_tasks: BackgroundTasks, participant=Depends(participant_auth)):
+        return submit_files(participant, background_tasks)
 
     @app.post('/api/participant/worksheets/{worksheet_id}/submit')
-    def submit_worksheet(worksheet_id: uuid.UUID, participant=Depends(participant_auth)):
-        result = submit_files(participant, str(worksheet_id))
+    def submit_worksheet(worksheet_id: uuid.UUID, background_tasks: BackgroundTasks, participant=Depends(participant_auth)):
+        result = submit_files(participant, background_tasks, str(worksheet_id))
         return result | {'worksheet_id': str(worksheet_id), 'pdf_url': f'/api/participant/worksheets/{worksheet_id}/submission'}
 
     @app.get('/api/participant/worksheets/{worksheet_id}/submission')
@@ -499,6 +448,7 @@ def create_app(settings: Settings | None = None, storage_override=None):
             fail(404, 'worksheet_missing', 'この参加者の対象に含まれていない用紙です。')
         with db.read() as s:
             row = s.get(WorksheetSubmission, (participant.submission_id, str(worksheet_id)))
+            previous_key = row.pdf_path if row else participant.pdf_path
             try:
                 if row:
                     data = storage.get(row.pdf_path)
@@ -510,7 +460,19 @@ def create_app(settings: Settings | None = None, storage_override=None):
             except HTTPException:
                 raise
             except Exception:
-                fail(503, 'storage_failed', '提出PDFを取得できませんでした。再度お試しください。')
+                # A completed resubmission may remove the old PDF or its parts
+                # while this request is reading them. Retry the committed key.
+                with db.read() as latest:
+                    replacement = latest.get(WorksheetSubmission, (participant.submission_id, str(worksheet_id)))
+                    current = latest.get(Participant, participant.id)
+                    key = replacement.pdf_path if replacement else current.pdf_path if current else None
+                    if not key or key == previous_key:
+                        fail(503, 'storage_failed', '提出PDFを取得できませんでした。再度お試しください。')
+                    try:
+                        data = storage.get(key) if replacement or len(groups) == 1 else legacy_worksheet_pdf(
+                            current, group, get_pages(latest, current), storage, registry.manifest_for(current)['pages'])
+                    except Exception:
+                        fail(503, 'storage_failed', '提出PDFを取得できませんでした。再度お試しください。')
         name = worksheet_pdf_name(participant, group, len(groups))
         return Response(data, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{name}"'})
 

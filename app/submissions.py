@@ -1,12 +1,13 @@
 """Per-worksheet submissions and compatibility with older combined submissions."""
-import io
 import json
 from datetime import timezone
 
-from pypdf import PdfReader, PdfWriter
+import fitz
 from sqlalchemy import select
 
 from app.database import WorksheetSubmission, utc_iso
+from app.pdf_engine import pdf_operation
+from app.submission_pdf import A4_HEIGHT, A4_WIDTH
 
 
 def worksheet_groups(participant, registry):
@@ -84,26 +85,24 @@ def worksheet_pdf_name(participant, group, group_count):
     return f'{participant.participant_id}.pdf' if group_count == 1 else f"{participant.participant_id}_{group['number']:02d}.pdf"
 
 
+@pdf_operation
 def legacy_worksheet_pdf(participant, group, pages, storage, configured_pages=None):
     """Read existing submissions without changing their stored PDF or study rows."""
-    combined = PdfReader(io.BytesIO(storage.get(participant.pdf_path)))
-    if configured_pages and len(combined.pages) == len(configured_pages):
-        positions = {page['qr_code']: index for index, page in enumerate(sorted(configured_pages, key=lambda item: item['page_number']))}
-    else:
-        positions = {entry.title.split(': ', 1)[1]: combined.get_destination_page_number(entry)
-                     for entry in combined.outline if hasattr(entry, 'title') and ': ' in entry.title}
-        if not positions:
-            pending_codes = {page.qr_code for page in pending_pages(pages, participant.submitted_at)}
-            submitted_pages = [page for page in pages if page.qr_code not in pending_codes
-                               or json.loads(page.metrics_json).get('legacy_submitted_photo', False)]
-            positions = {page.qr_code: index for index, page in enumerate(sorted(submitted_pages, key=lambda item: item.page_number))}
-    writer = PdfWriter()
-    for configured in group['pages']:
-        index = positions.get(configured['qr_code'])
-        if index is None:
-            writer.add_blank_page(width=595.2756, height=841.8898)
+    with fitz.open(stream=storage.get(participant.pdf_path), filetype='pdf') as combined, fitz.open() as writer:
+        if configured_pages and len(combined) == len(configured_pages):
+            positions = {page['qr_code']: index for index, page in enumerate(sorted(configured_pages, key=lambda item: item['page_number']))}
         else:
-            writer.add_page(combined.pages[index])
-    output = io.BytesIO()
-    writer.write(output)
-    return output.getvalue()
+            positions = {title.split(': ', 1)[1]: number - 1
+                         for _, title, number in combined.get_toc() if ': ' in title and number > 0}
+            if not positions:
+                pending_codes = {page.qr_code for page in pending_pages(pages, participant.submitted_at)}
+                submitted_pages = [page for page in pages if page.qr_code not in pending_codes
+                                   or json.loads(page.metrics_json).get('legacy_submitted_photo', False)]
+                positions = {page.qr_code: index for index, page in enumerate(sorted(submitted_pages, key=lambda item: item.page_number))}
+        for configured in group['pages']:
+            index = positions.get(configured['qr_code'])
+            if index is None:
+                writer.new_page(width=A4_WIDTH, height=A4_HEIGHT)
+            else:
+                writer.insert_pdf(combined, from_page=index, to_page=index, final=False)
+        return writer.tobytes(garbage=1, deflate=True)
